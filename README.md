@@ -23,8 +23,9 @@ First, make sure you've cloned the repo
 git clone https://github.com/MaximeRobeyns/self_improving_coding_agent
 ```
 
-Then, export some environment variables which will be made available in the
-docker container. The project supports inference from a number of providers to
+Then, export some environment variables in the shell from which you run the
+agent. They are handed to each docker container when it is started, and are
+not stored in the docker image. The project supports inference from a number of providers to
 allow for experimentation across many models. You must export at least one of
 these in your _local_ shell, which you can do either directly or with `direnv`,
 `dotenv`, etc. Omitting any provider key will simply make that provider's
@@ -40,9 +41,11 @@ export DEEPSEEK_API_KEY=  # For DeepSeek direct inference (V3, R1)
 export MODAL_TOKEN_ID=  # To allow the agent to visit webpages and read papers
 export MODAL_TOKEN_SECRET=  # To allow the agent to visit webpages and read papers
 ```
-For gemini, you should replace the template file in `sandbox/GOOGLE_APPLICATION_CREDENTIALS.json` with your own credentials.
+For gemini, you should replace the template file in `sandbox/GOOGLE_APPLICATION_CREDENTIALS.json` with your own credentials. This file is mounted into the containers read-only; it is not copied into the image either.
 
-Once you have at least one LLM provider's API key exported, you can build the docker image. The build command is wrapped in a Makefile target for convenience:
+> If you built the image with an earlier version of this repository, your API keys are stored in it. Rebuild it, and remove the old images (`docker image ls sica_sandbox`, then `docker image rm <id>`), before sharing or pushing an image anywhere.
+
+Next, build the docker image. The build command is wrapped in a Makefile target for convenience:
 
 ```bash
 make image

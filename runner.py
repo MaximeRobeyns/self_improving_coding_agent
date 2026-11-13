@@ -81,6 +81,21 @@ benchmark_locks = {}
 # of their own, tagged SANDBOX_IMAGE:run{exp_id}_agent{agent_id}.
 SANDBOX_IMAGE = "sica_sandbox"
 
+# Credentials are not built into the sandbox image, but handed to each
+# container when it is started. These variables are passed on if set:
+SANDBOX_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "FIREWORKS_AI_API_KEY",
+    "GEMINI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "VERTEX_PROJECT_ID",
+    "VERTEX_REGION",
+)
+# and this file, if it exists, is mounted read-only:
+GOOGLE_CREDENTIALS_FILE = Path("sandbox/GOOGLE_APPLICATION_CREDENTIALS.json")
+CONTAINER_GOOGLE_CREDENTIALS = "/tmp/GOOGLE_APPLICATION_CREDENTIALS.json"
+
 # Limits for the meta agent when it is asked to fix an agent that failed the
 # validation gate
 GATE_FIX_TIMEOUT_SECONDS = 30 * 60
@@ -228,6 +243,28 @@ def get_next_dir_number(base_dir: str | Path) -> int:
     if not numbered_dirs:
         return 1
     return max(numbered_dirs) + 1
+
+
+def sandbox_secret_args() -> list[str]:
+    """`docker run` arguments that give a container its credentials.
+
+    Variables are passed by name only (`-e NAME`): docker takes the value
+    from this process's environment, so that it never appears on a command
+    line, in a log, or in a file. Commands run later with `docker exec`
+    inherit them.
+    """
+    args: list[str] = []
+    for name in SANDBOX_ENV_VARS:
+        if os.environ.get(name):
+            args += ["-e", name]
+    if GOOGLE_CREDENTIALS_FILE.is_file():
+        args += [
+            "-v",
+            f"{GOOGLE_CREDENTIALS_FILE.absolute()}:{CONTAINER_GOOGLE_CREDENTIALS}:ro",
+            "-e",
+            f"GOOGLE_APPLICATION_CREDENTIALS={CONTAINER_GOOGLE_CREDENTIALS}",
+        ]
+    return args
 
 
 async def run_docker_command(*args) -> tuple[bool, str, str]:
@@ -600,6 +637,7 @@ async def process_job(
             container_name,
         ]
         container_cmd += ["-p", MONITOR_PORT_MAPPING]
+        container_cmd += sandbox_secret_args()
         # Mount the experiment directory (results/run_{i})
         container_cmd += [
             "-v",
@@ -972,7 +1010,10 @@ async def resolve_agent_image(exp_id: int, agent_id: int) -> str:
 
 async def build_agent_image(tag: str, agent_code_dir: Path) -> tuple[bool, str]:
     """Build the sandbox image for an agent, installing the requirements.txt
-    of that agent's code. Returns (success, stderr)."""
+    of that agent's code. Returns (success, stderr).
+
+    No credentials go into the image: see sandbox_secret_args.
+    """
     target_arch = "x86_64"  # Default architecture
     # Detect if the script is running on a Mac with Apple Silicon
     if platform.system() == "Darwin" and platform.processor() == "arm":
@@ -980,15 +1021,6 @@ async def build_agent_image(tag: str, agent_code_dir: Path) -> tuple[bool, str]:
     build_cmd = ["docker", "buildx", "build"]
     build_cmd += ["--build-context", f"base_agent={agent_code_dir.absolute()}"]
     build_cmd += ["--build-arg", f"TARGET_ARCH={target_arch}"]
-    for key in (
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "FIREWORKS_AI_API_KEY",
-        "GEMINI_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "VERTEX_PROJECT_ID",
-    ):
-        build_cmd += ["--build-arg", f"{key}={os.environ.get(key)}"]
     build_cmd += ["-f", "sandbox/Dockerfile", "-t", tag, "--load", "sandbox"]
     success, _, stderr = await run_docker_command(*build_cmd)
     return success, stderr
@@ -1022,6 +1054,7 @@ async def gate_container(exp_id: int, agent_id: int, image: str, agent_code_dir:
         # caches and other files behind, which must not end up in the agent
         success, _, stderr = await run_docker_command(
             "docker", "run", "--rm", "-d", "--name", name,
+            *sandbox_secret_args(),
             "-v", f"{agent_code_dir.absolute()}:/mnt/agent_code:ro",
             image, "tail", "-f", "/dev/null",
         )  # fmt: skip
@@ -1205,6 +1238,7 @@ async def run_meta_agent_benchmark(
         container_cmd = ["docker", "run", "--rm", "-d", "--name", container_name]
         # Publish the monitoring server on a free host port
         container_cmd += ["-p", MONITOR_PORT_MAPPING]
+        container_cmd += sandbox_secret_args()
         # Mount the full agent archive as read-only
         container_cmd += ["-v", f"{exp_dir.absolute()}:/home/agent/archive:ro"]
         # Mount the new agent directory as the workdir
@@ -1749,6 +1783,15 @@ async def main():
 
     if args.children < 1:
         parser.error("--children must be at least 1")
+
+    passed_on = [name for name in SANDBOX_ENV_VARS if os.environ.get(name)]
+    if passed_on:
+        logger.info(f"Passed on to the sandbox: {', '.join(passed_on)}")
+    else:
+        logger.warning(
+            "None of the provider API keys are set in this shell, so agents will "
+            f"not be able to call any model ({', '.join(SANDBOX_ENV_VARS)})"
+        )
 
     selection_seed = resolve_selection_seed(exp_dir, args.seed)
     logger.info(

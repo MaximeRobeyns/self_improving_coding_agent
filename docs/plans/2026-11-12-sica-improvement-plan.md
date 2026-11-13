@@ -142,7 +142,9 @@ class ParentSelector(Protocol):
 
 하나라도 실패하면 `status: "invalid"`로 기록하고 평가를 건너뛴다. `--gate-retries N`이면 실패 로그를 붙여 메타 개선을 다시 시도한다.
 
-### 1-2. 시크릿 런타임 주입 (F7)
+### 1-2. 시크릿 런타임 주입 (F7) (구현 완료)
+
+구현 메모: 계획의 `--env-file`(임시 파일) 대신 `docker run -e NAME`(값 없이 이름만)을 쓴다. Docker가 runner 프로세스의 환경에서 값을 가져오므로 키가 명령줄에도, 디스크에도 남지 않는다. `VERTEX_REGION`도 전달 대상에 넣었다. Makefile의 `int`, `meta`, `test_meta_int`도 같은 방식으로 키를 넘긴다.
 
 - Dockerfile의 `ARG`/`ENV` 키 블록 삭제. `docker run`에 `--env-file`(runner가 0600 권한 임시 파일로 생성) 전달.
 - `runner.py:936-962`와 `Makefile`의 `--build-arg` 키 전달 삭제.

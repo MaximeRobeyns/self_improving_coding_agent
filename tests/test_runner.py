@@ -3,6 +3,7 @@ import shutil
 import asyncio
 
 import json
+from pathlib import Path
 import pytest
 
 try:
@@ -1385,3 +1386,83 @@ def test_gate_cli_arguments():
     assert GateConfig.parse_checks(args.gate_checks) == ("import", "smoke")
     assert (args.gate_retries, args.gate_model) == (2, "GPT4O_MINI")
     assert GateConfig.parse_checks(parser.parse_args(["--gate-checks", "none"]).gate_checks) == ()
+
+
+# Credentials ------------------------------------------------------------------
+
+REPO_ROOT = Path(runner.__file__).parent
+SECRET = "sk-test-secret-value"
+
+
+@pytest.fixture
+def api_keys(monkeypatch):
+    for name in runner.SANDBOX_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+    monkeypatch.setenv("VERTEX_REGION", "europe-west1")
+    monkeypatch.setenv("OPENAI_API_KEY", "")  # set, but empty
+
+
+def test_secrets_are_passed_by_name_only(experiment, api_keys):
+    args = runner.sandbox_secret_args()
+
+    assert args == ["-e", "ANTHROPIC_API_KEY", "-e", "VERTEX_REGION"]
+    assert SECRET not in " ".join(args)
+
+
+def test_google_credentials_are_mounted_read_only(experiment, api_keys):
+    credentials = Path("sandbox/GOOGLE_APPLICATION_CREDENTIALS.json")
+    credentials.parent.mkdir()
+    credentials.write_text("{}")
+
+    args = runner.sandbox_secret_args()
+
+    assert args[-4:] == [
+        "-v",
+        f"{credentials.absolute()}:/tmp/GOOGLE_APPLICATION_CREDENTIALS.json:ro",
+        "-e",
+        "GOOGLE_APPLICATION_CREDENTIALS=/tmp/GOOGLE_APPLICATION_CREDENTIALS.json",
+    ]
+
+
+def test_every_container_gets_the_credentials_and_no_command_holds_a_value(
+    experiment, docker, api_keys, fake_benchmark
+):
+    create(experiment)  # meta-improvement, image build, validation gate
+    run_queue(experiment, select_problems=lambda b: b.problems[:1])  # a benchmark
+
+    runs = docker.calls_to("run")
+    assert len(runs) == 3
+    for run_cmd in runs:
+        position = run_cmd.index("ANTHROPIC_API_KEY")
+        assert run_cmd[position - 1] == "-e"
+        # Options have to come before the image name
+        assert position < run_cmd.index("tail") - 1
+    for call in docker.calls:
+        assert SECRET not in " ".join(map(str, call))
+
+
+def test_image_build_takes_no_credentials(experiment, docker, api_keys):
+    create(experiment)
+
+    (build_cmd,) = docker.calls_to("buildx")
+    build_args = [build_cmd[i + 1] for i, arg in enumerate(build_cmd) if arg == "--build-arg"]
+    assert len(build_args) == 1 and build_args[0].startswith("TARGET_ARCH=")
+
+
+def test_no_credentials_in_the_image_definition():
+    dockerfile = (REPO_ROOT / "sandbox" / "Dockerfile").read_text()
+    instructions = [
+        line for line in dockerfile.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    ]
+    for line in instructions:
+        assert "API_KEY" not in line
+        assert "VERTEX_PROJECT_ID" not in line
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in line
+
+    makefile = (REPO_ROOT / "Makefile").read_text()
+    for line in makefile.splitlines():
+        if "--build-arg" in line:
+            assert "TARGET_ARCH" in line
+    # Each container that the Makefile starts is given the credentials
+    assert makefile.count("docker run") == makefile.count("$(SANDBOX_SECRETS)") == 3

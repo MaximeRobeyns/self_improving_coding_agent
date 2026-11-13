@@ -136,22 +136,9 @@ WORKDIR ${SANDBOX_DIR}
 # Expose necessary ports (maintaining current approach)
 EXPOSE 5000 80 22 443 8080 8000
 
-ARG ANTHROPIC_API_KEY
-ARG OPENAI_API_KEY
-ARG FIREWORKS_AI_API_KEY
-ARG GEMINI_API_KEY
-ARG DEEPSEEK_API_KEY
-ARG VERTEX_PROJECT_ID
-
-ENV ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-ENV OPENAI_API_KEY=${OPENAI_API_KEY}
-ENV FIREWORKS_AI_API_KEY=${FIREWORKS_AI_API_KEY}
-ENV GEMINI_API_KEY=${GEMINI_API_KEY}
-ENV DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-ENV VERTEX_PROJECT_ID=${VERTEX_PROJECT_ID}
-
-COPY GOOGLE_APPLICATION_CREDENTIALS.json /tmp/GOOGLE_APPLICATION_CREDENTIALS.json
-ENV GOOGLE_APPLICATION_CREDENTIALS=/tmp/GOOGLE_APPLICATION_CREDENTIALS.json
+# No credentials are built into the image: API keys and the Google
+# credentials file are handed to containers when they are started (see
+# sandbox_secret_args in runner.py, and SANDBOX_SECRETS in the Makefile).
 
 # Set the entrypoint (maintaining current approach)
 CMD ["/bin/bash", "--login"]

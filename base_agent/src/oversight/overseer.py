@@ -162,7 +162,7 @@ class Overseer:
     Asynchronous overseer that monitors agent execution through callgraph analysis.
     """
 
-    def __init__(self, model: Model = Model.SONNET_37, check_interval: float = 60.0):
+    def __init__(self, model: Model = Model.SONNET_55, check_interval: float = 60.0):
         """
         Initialize the overseer.
 

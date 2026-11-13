@@ -199,6 +199,15 @@ class ModelInfo:
     context_window: int = 0  # Maximum total tokens (prompt + completion) supported
     function_calling_interface: FCI = FCI.UNCONSTRAINED  # function calling interface
     preferred_arg_format: ArgFormat = ArgFormat.XML  # XML or JSON preferred
+    # What the model's API accepts. The defaults describe the older models;
+    # current Claude models reject all three of these with a 400:
+    # - a request whose last message is an assistant turn to be continued
+    supports_prefill: bool = True
+    # - temperature / top_p
+    supports_sampling_params: bool = True
+    # - a thinking token budget. Models with adaptive thinking decide how much
+    #   to think themselves, steered by an effort level.
+    adaptive_thinking: bool = False
 
 
 class Model(Enum):
@@ -207,6 +216,10 @@ class Model(Enum):
     Note, all costs are reported in USD per million tokens.
     """
 
+    # Claude 3.x models. These have been retired from the Claude API (Sonnet
+    # 3.5 on 2025-10-28, Sonnet 3.7 and Haiku 3.5 on 2026-02-19): requests to
+    # them fail. They are kept so that results of past runs can still be
+    # costed and analysed.
     HAIKU_35 = ModelInfo(
         api_name="claude-3-5-haiku-20241022",
         provider=Provider.ANTHROPIC,
@@ -255,6 +268,71 @@ class Model(Enum):
         reasoning_model=True,
         function_calling_interface=FCI.UNCONSTRAINED,
         preferred_arg_format=ArgFormat.XML,
+    )
+
+    # Current Claude models. Prices are Anthropic's first-party API rates in
+    # USD per million tokens; cache writes are 1.25x the input price.
+    HAIKU_55 = ModelInfo(
+        api_name="claude-haiku-5-5",
+        provider=Provider.ANTHROPIC,
+        costs=TokenCost(
+            # For prompts of up to 100K tokens; longer prompts are billed at
+            # 0.50 / 2.50, which is not modelled here
+            input_uncached=0.10,
+            input_cached=0.01,
+            cache_write=0.125,
+            output=0.50,
+        ),
+        # The model allows up to 128K output tokens, but only when streaming
+        max_tokens=16000,
+        supports_caching=True,
+        context_window=1_000_000,
+        reasoning_model=True,
+        function_calling_interface=FCI.UNCONSTRAINED,
+        preferred_arg_format=ArgFormat.XML,
+        supports_prefill=False,
+        supports_sampling_params=False,
+        adaptive_thinking=True,
+    )
+
+    SONNET_55 = ModelInfo(
+        api_name="claude-sonnet-5-5",
+        provider=Provider.ANTHROPIC,
+        costs=TokenCost(
+            input_uncached=2.00,
+            input_cached=0.10,
+            cache_write=2.50,
+            output=10.00,
+        ),
+        max_tokens=16000,
+        supports_caching=True,
+        context_window=1_000_000,
+        reasoning_model=True,
+        function_calling_interface=FCI.UNCONSTRAINED,
+        preferred_arg_format=ArgFormat.XML,
+        supports_prefill=False,
+        supports_sampling_params=False,
+        adaptive_thinking=True,
+    )
+
+    OPUS_55 = ModelInfo(
+        api_name="claude-opus-5-5",
+        provider=Provider.ANTHROPIC,
+        costs=TokenCost(
+            input_uncached=4.00,
+            input_cached=0.20,
+            cache_write=5.00,
+            output=20.00,
+        ),
+        max_tokens=16000,
+        supports_caching=True,
+        context_window=1_000_000,
+        reasoning_model=True,
+        function_calling_interface=FCI.UNCONSTRAINED,
+        preferred_arg_format=ArgFormat.XML,
+        supports_prefill=False,
+        supports_sampling_params=False,
+        adaptive_thinking=True,
     )
 
     SONNET_37_VERTEX = ModelInfo(
@@ -484,6 +562,22 @@ class Model(Enum):
         return self.value.context_window
 
     @property
+    def supports_prefill(self) -> bool:
+        """Whether a request may end in an assistant turn for the model to continue."""
+        return self.value.supports_prefill
+
+    @property
+    def supports_sampling_params(self) -> bool:
+        """Whether the model accepts temperature / top_p."""
+        return self.value.supports_sampling_params
+
+    @property
+    def adaptive_thinking(self) -> bool:
+        """Whether the model sets its own amount of thinking, steered by an
+        effort level, rather than taking a thinking token budget."""
+        return self.value.adaptive_thinking
+
+    @property
     def fci(self) -> FCI:
         """Get the model's function calling interface"""
         return self.value.function_calling_interface
@@ -515,16 +609,21 @@ class Model(Enum):
 
 
 MODEL_FAILOVER_MAP = {
-    Model.SONNET_35: Model.FIREWORKS_DEEPSEEK_V3,
-    Model.SONNET_37: Model.SONNET_35,
-    Model.SONNET_37_VERTEX: Model.SONNET_37,
-    Model.GPT4O: Model.SONNET_35,
+    Model.HAIKU_55: Model.SONNET_55,
+    Model.SONNET_55: Model.OPUS_55,
+    Model.OPUS_55: Model.SONNET_55,
+    # The retired Claude models fail over to their current counterparts
+    Model.HAIKU_35: Model.HAIKU_55,
+    Model.SONNET_35: Model.SONNET_55,
+    Model.SONNET_37: Model.SONNET_55,
+    Model.SONNET_37_VERTEX: Model.SONNET_55,
+    Model.GPT4O: Model.SONNET_55,
     Model.O1: Model.FIREWORKS_DEEPSEEK_R1,
     Model.O3_MINI: Model.FIREWORKS_DEEPSEEK_R1,
     Model.DEEPSEEK_V3: Model.FIREWORKS_DEEPSEEK_V3,
     Model.DEEPSEEK_R1: Model.FIREWORKS_DEEPSEEK_R1,
-    Model.FIREWORKS_DEEPSEEK_V3: Model.SONNET_35,
+    Model.FIREWORKS_DEEPSEEK_V3: Model.SONNET_55,
     Model.FIREWORKS_DEEPSEEK_R1: Model.O1,
-    Model.GEMINI_FLASH_2: Model.HAIKU_35,
+    Model.GEMINI_FLASH_2: Model.HAIKU_55,
     Model.GEMINI_25_PRO: Model.GEMINI_25_PRO,
 }

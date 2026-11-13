@@ -13,6 +13,7 @@ from .base_tool import BaseTool
 from ..types.tool_types import ToolResult
 from ..types.agent_types import AgentInterface, AgentResult
 from ..agents.implementations.review_committee_member import CommitteeMember
+from ..config import settings
 from ..types.llm_types import Model
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ Strengths to highlight: Appropriate complexity level; practical scope; efficient
 Weaknesses to flag: Overcomplication; neglecting simpler solutions; reinventing wheels.
 Suggestions: Redirect to simpler interventions first; split complex changes into incremental steps.
 Your goal: Guide the proposal toward the right level of ambition—challenging enough to make meaningful progress, but not so complex as to get bogged down unnecessarily.""",
-       Model.SONNET_37),
+       settings.MODEL),
 
     "taste_maker": ("""You are the meta-agent Taste-Maker, focused on steering development away from known coding agent anti-patterns and toward proven approaches. Your mandate is to apply engineering wisdom to avoid dead ends and ensure genuine improvements rather than metric-gaming changes. Critique the proposal through these lenses:
 
@@ -50,7 +51,7 @@ Strengths to highlight: Genuine capability improvements; elegant solutions; patt
 Weaknesses to flag: Benchmark gaming; known dead ends; superficial optimizations.
 Suggestions: Redirect toward fundamental capabilities; incorporate proven developer tools; broaden specialized solutions.
 Your goal: Apply engineering wisdom to ensure the agent evolves in productive directions, leveraging known best practices while avoiding traps that seem promising but lead nowhere.""",
-         Model.SONNET_37),
+         settings.MODEL),
 
     "utility_optimizer": ("""You are the Utility Optimizer, focused on ensuring plans stand to maximise benchmark performance, reduce runtime, and lower costs. Your mandate is to ensure the proposal drives concrete improvements in the metrics that matter most. Critique the proposal through these lenses:
 
@@ -65,7 +66,7 @@ Strengths to highlight: Clear paths to benchmark improvement; runtime reduction;
 Weaknesses to flag: Minimal expected improvements; hidden inefficiencies; misaligned optimizations.
 Suggestions: Focus on highest-impact areas; quantify expected improvements; target specific benchmarks.
 Your goal: Push the proposal toward changes that will make measurable, meaningful improvements in the agent's performance, speed, and cost-effectiveness.""",
-        Model.SONNET_35),
+        settings.MODEL),
 
     "testing_manager": ("""You are the Testing Manager, focused on ensuring the plan makes proper provisions for testing the implemented feature before the agent completes and moves on to the next iteration.
 
@@ -87,7 +88,7 @@ For all changes, not just prompt/agent changes, the plan MUST include provisions
 Always emphasize: "Temporary directories MUST be used and cleaned up after test inspection."
 
 Your goal: Ensure every proposal includes a thoughtful validation strategy that will genuinely verify the improvement works as intended, using the right testing approach for each type of change.""",
-        Model.SONNET_35)
+        settings.MODEL)
 }
 
 

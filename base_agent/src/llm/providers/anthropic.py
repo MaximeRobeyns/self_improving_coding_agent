@@ -275,6 +275,14 @@ class AnthropicRateLimiter:
 anthropic_rate_limiter = AnthropicRateLimiter()
 
 
+# Sent as the closing user turn to models that cannot be handed an unfinished
+# assistant turn to continue (see _prepare_messages)
+CONTINUATION_PROMPT = (
+    "Continue from exactly where the above leaves off. Do not repeat or "
+    "summarise what is already there: take the next step."
+)
+
+
 class AnthropicProvider(BaseProvider):
     """Provider implementation for Anthropic's Claude models."""
 
@@ -308,6 +316,12 @@ class AnthropicProvider(BaseProvider):
             return StopReason.STOP_TOKEN, response.stop_sequence
         elif raw_stop_reason == "tool_use":
             return StopReason.TOOL_CALL, None
+        elif raw_stop_reason == "refusal":
+            # The request was declined by a safety classifier; there is no
+            # usable content. `stop_details` says which category, if any.
+            details = getattr(response, "stop_details", None)
+            logger.warning(f"Anthropic declined the request (refusal): {details}")
+            return StopReason.ERROR, None
         else:
             return StopReason.ERROR, None
 
@@ -330,7 +344,7 @@ class AnthropicProvider(BaseProvider):
             raise ValueError(f"Unhandled content type in provider Anthropic: {block}")
 
     def _prepare_messages(
-        self, messages: list[Message]
+        self, messages: list[Message], model: Model | None = None
     ) -> tuple[Optional[list[dict]], list[dict]]:
         """Process and prepare messages for the Anthropic API.
 
@@ -338,6 +352,8 @@ class AnthropicProvider(BaseProvider):
         1. System messages must be separated and structured
         2. Assistant messages need content trimming
         3. Names and cache control flags must be properly formatted
+        4. For models that do not accept a request ending in an assistant
+           turn (see CONTINUATION_PROMPT), a user turn is appended
 
         Returns:
             Tuple of (system_content, anthropic_messages)
@@ -378,6 +394,23 @@ class AnthropicProvider(BaseProvider):
 
         # Default to setting a cache break point at the last message
         anthropic_messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+
+        # The agents send their work so far as an assistant turn for the model
+        # to carry on from. Models that reject that get a user turn asking
+        # them to carry on instead. It goes after the cache break point: the
+        # work so far is then a prefix of the next request, which this
+        # closing turn would not be.
+        if (
+            model is not None
+            and not model.supports_prefill
+            and anthropic_messages[-1]["role"] == "assistant"
+        ):
+            anthropic_messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": CONTINUATION_PROMPT}],
+                }
+            )
 
         if isinstance(system_content, list) and len(system_content) > 0:
             system_content[-1]["cache_control"] = {"type": "ephemeral"}
@@ -431,6 +464,37 @@ class AnthropicProvider(BaseProvider):
             }
 
         raise ValueError("tool is not BaseTool or BaseAgent")
+
+    def _model_args(
+        self,
+        model: Model,
+        temperature: float,
+        top_p: float,
+        reasoning_effort: ReasoningEffort | None,
+    ) -> dict:
+        """The request arguments that depend on what the model accepts:
+        sampling parameters and thinking."""
+        args: dict = {}
+        if model.supports_sampling_params:
+            args["temperature"] = temperature
+            args["top_p"] = top_p
+
+        if model.adaptive_thinking:
+            # Thinking is on and sized by the model itself; a thinking budget
+            # is rejected. How hard it works is steered by the effort level,
+            # which is left at the model's default unless one is asked for.
+            if reasoning_effort is not None:
+                args["extra_body"] = {"output_config": {"effort": reasoning_effort.value}}
+        elif model.is_reasoner and reasoning_effort is not None:
+            args["temperature"] = 1.0
+            args.pop("top_p", None)
+            args["extra_body"] = {
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": self._reasoning_budgets_to_tokens(reasoning_effort),
+                }
+            }
+        return args
 
     def _reasoning_budgets_to_tokens(self, reasoning_effort: ReasoningEffort) -> int:
         if reasoning_effort == ReasoningEffort.LOW:
@@ -570,15 +634,14 @@ class AnthropicProvider(BaseProvider):
                 logger.debug(f"Creating completion with stop tokens: {stop}")
 
                 # Process messages
-                system_content, anthropic_messages = self._prepare_messages(messages)
+                system_content, anthropic_messages = self._prepare_messages(messages, model)
 
                 # Prepare arguments
                 args = {
                     "messages": anthropic_messages,
                     "model": model.id,
-                    "temperature": temperature,
-                    "top_p": top_p,
                     "max_tokens": max_tokens or model.max_output_tokens,
+                    **self._model_args(model, temperature, top_p, reasoning_effort),
                 }
 
                 if system_content:
@@ -591,15 +654,6 @@ class AnthropicProvider(BaseProvider):
                 if available_tools and model.fci == FCI.CONSTRAINED:
                     args["tools"] = [self.pydantic_to_native_tool(t) for t in available_tools]
 
-                if model.is_reasoner and reasoning_effort is not None:
-                    args["temperature"] = 1.0
-                    del args["top_p"]
-                    args["extra_body"] = {
-                        "thinking": {
-                            "type": "enabled",
-                            "budget_tokens": self._reasoning_budgets_to_tokens(reasoning_effort),
-                        }
-                    }
 
                 # Execute the request with raw response to get headers
                 try:
@@ -670,9 +724,14 @@ class AnthropicProvider(BaseProvider):
                                 )
                             )
                         case 'thinking':
-                            response_content.append(
-                                ReasoningContent(text=block.thinking)
-                            )
+                            # Current models return their thinking blocks
+                            # empty unless a summary is asked for
+                            if getattr(block, "thinking", ""):
+                                response_content.append(
+                                    ReasoningContent(text=block.thinking)
+                                )
+                        case 'redacted_thinking':
+                            pass
                         case _:
                             logger.warning(
                                 f"Unhandled response block type {block.type} in Anthropic completion"
@@ -758,16 +817,15 @@ class AnthropicProvider(BaseProvider):
         initial_prompt_tokens = 0  # Track initial prompt tokens
 
         # Process messages
-        system_content, anthropic_messages = self._prepare_messages(messages)
+        system_content, anthropic_messages = self._prepare_messages(messages, model)
 
         # Prepare arguments
         args = {
             "messages": anthropic_messages,
             "model": model.id,
-            "temperature": temperature,
-            "top_p": top_p,
             "max_tokens": max_tokens or model.max_output_tokens,
             "stream": True,
+            **self._model_args(model, temperature, top_p, None),
         }
 
         if system_content:

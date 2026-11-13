@@ -63,7 +63,7 @@ class BaseAgent(AgentInterface):
     AVAILABLE_AGENTS: ClassVar[Set[Type[AgentInterface]]] = set()
 
     HAS_FILEVIEW: ClassVar[bool] = True
-    MODEL: ClassVar[Model] = Model.SONNET_37
+    MODEL: ClassVar[Model] = Model.SONNET_55
     TEMPERATURE: ClassVar[float] = 0.666
     MAX_ITERATIONS: ClassVar[int] = 500
     INHERITANCE: ClassVar[InheritanceConfig] = InheritanceConfig()

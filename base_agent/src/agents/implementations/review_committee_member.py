@@ -77,7 +77,7 @@ Provide a structured evaluation: identify strengths, flag weaknesses, and sugges
     specialisation: str = Field(
         ..., description="The specialisation of this committee member"
     )
-    model: Model = Field(default=Model.SONNET_35)
+    model: Model = Field(default_factory=lambda: settings.MODEL)
 
     def __init__(
         self,

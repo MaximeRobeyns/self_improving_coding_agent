@@ -51,8 +51,11 @@ def test_monitor_port_mapping_lets_docker_pick_the_host_port():
 class FakeDocker:
     """Replaces run_docker_command; fails the sub-commands named in `fail`."""
 
-    def __init__(self, fail: set[str] = frozenset()):
+    def __init__(self, fail: set[str] = frozenset(), fail_commands: dict | None = None):
         self.fail = fail
+        # {text: n}: commands containing the text fail, the first n times
+        # they are run (always, if n is None)
+        self.fail_commands = dict(fail_commands or {})
         self.calls: list[tuple] = []
 
     async def __call__(self, *args):
@@ -60,6 +63,14 @@ class FakeDocker:
         subcommand = args[1]
         if subcommand in self.fail:
             return False, "", f"{subcommand} went wrong"
+        text = " ".join(map(str, args))
+        for marker, remaining in self.fail_commands.items():
+            if marker in text and remaining != 0:
+                if remaining is not None:
+                    self.fail_commands[marker] = remaining - 1
+                return False, "", f"{marker} went wrong"
+        if subcommand == "exec" and "cat" in args:
+            return True, "4", ""  # the answer of the validation gate's smoke run
         if subcommand == "inspect":
             return True, '"running"', ""
         if subcommand == "port":
@@ -70,6 +81,20 @@ class FakeDocker:
 
     def calls_to(self, subcommand: str) -> list[tuple]:
         return [c for c in self.calls if c[1] == subcommand]
+
+    def meta_run(self) -> tuple:
+        """The `docker run` of the container that the meta agent works in"""
+        (cmd,) = [
+            c for c in self.calls_to("run") if any(":/home/agent/workdir:rw" in a for a in c)
+        ]
+        return cmd
+
+    def gate_runs(self) -> list[tuple]:
+        """The `docker run`s of validation containers"""
+        return [c for c in self.calls_to("run") if any(":/mnt/agent_code:ro" in a for a in c)]
+
+    def commands_containing(self, text: str) -> list[tuple]:
+        return [c for c in self.calls if text in " ".join(map(str, c))]
 
 
 def make_agent(exp_dir, agent_id, parent_id=None, status="ok", description=None):
@@ -194,7 +219,7 @@ def test_meta_agent_is_told_which_agents_it_works_on(scored_experiment, docker):
 def test_container_uses_a_docker_assigned_port(experiment, docker):
     create(experiment)
 
-    (run_cmd,) = docker.calls_to("run")
+    run_cmd = docker.meta_run()
     assert run_cmd[run_cmd.index("-p") + 1] == "127.0.0.1::8080"
     assert "8080:8080" not in run_cmd
 
@@ -210,7 +235,7 @@ def test_new_agent_gets_an_image_built_from_its_own_code(experiment, docker):
 
 def test_meta_agent_runs_in_its_own_image(experiment, docker):
     create(experiment, child(meta_agent_id=0))
-    (run_cmd,) = docker.calls_to("run")
+    run_cmd = docker.meta_run()
     assert "sica_sandbox:run1_agent0" in run_cmd
 
 
@@ -220,7 +245,7 @@ def test_agents_without_an_image_run_in_the_base_image(experiment, monkeypatch):
 
     create(experiment)
 
-    (run_cmd,) = docker.calls_to("run")
+    run_cmd = docker.meta_run()
     assert run_cmd[run_cmd.index("tail") - 1] == "sica_sandbox"
 
 
@@ -394,7 +419,7 @@ class FakeSteps:
     async def benchmarks(self, exp_dir, agent_dir, benchmarks, workers, **kwargs):
         self.events.append(("evaluate", int(agent_dir.name.split("_")[1])))
 
-    async def create(self, exp_id, exp_dir, planned):
+    async def create(self, exp_id, exp_dir, planned, gate=None):
         self.planned.append({k: v for k, v in planned.items() if k != "selection"})
         agent_id = planned["id"]
         agent_dir = exp_dir / f"agent_{agent_id}"
@@ -1088,3 +1113,275 @@ def test_meta_cli_arguments():
     for bad in (["--meta-agent", "strongest"], ["--meta-agent", "-1"], ["--meta-model", "nope"]):
         with pytest.raises(SystemExit):
             parser.parse_args(bad)
+
+
+# Validation gate ----------------------------------------------------------------
+
+from search.gate import GateConfig
+
+
+def test_new_agent_is_validated_in_its_own_image(experiment, docker):
+    record = create(experiment)
+
+    assert record["status"] == "ok"
+    assert record["gate"]["passed"] is True
+    assert [c["name"] for c in record["gate"]["checks"]] == ["import", "tests", "smoke"]
+    assert record["gate"]["fix_attempts"] == 0
+    assert record["tests_passed"] is True
+    (gate_run,) = docker.gate_runs()
+    assert "sica_sandbox:run1_agent1" in gate_run
+    # The agent's code is mounted read-only, and copied before anything runs
+    assert f"{experiment / 'agent_1' / 'agent_code'}:/mnt/agent_code:ro" in gate_run
+    assert docker.commands_containing("cp -r /mnt/agent_code /home/agent/agent_code")
+    assert not list((experiment / "agent_1" / "agent_code").glob("**/.pytest_cache"))
+    # Both containers are removed
+    assert len(docker.calls_to("rm")) == 2
+
+
+@pytest.mark.parametrize(
+    "broken, check",
+    [
+        ("import agent_code.agent", "import"),
+        ("&& pytest", "tests"),
+        ("agent_code benchmark", "smoke"),
+    ],
+)
+def test_agent_that_cannot_run_is_marked_invalid(experiment, monkeypatch, broken, check):
+    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    docker = FakeDocker(fail_commands={broken: None})
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+
+    record = create(experiment)
+
+    assert record["status"] == "invalid"
+    assert f"Validation gate failed at '{check}'" in record["failure_reason"]
+    assert record["gate"]["passed"] is False
+    assert record["gate"]["checks"][-1]["name"] == check
+    assert "went wrong" in record["gate"]["checks"][-1]["output"]
+    # It is not evaluated, and never built upon
+    assert runner.get_failed_iterations(experiment) == {1}
+    # What it cost to make is still accounted for
+    assert record["usage"]["cost"] == 0.25
+
+
+def test_invalid_agent_is_final(experiment, monkeypatch):
+    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    docker = FakeDocker(fail_commands={"import agent_code.agent": None})
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+    create(experiment)
+
+    with pytest.raises(ValueError, match="already been created"):
+        create(experiment)
+
+
+def test_failing_tests_inherited_from_the_parent_do_not_invalidate(experiment, monkeypatch):
+    runner.write_lineage(experiment / "agent_0", tests_passed=False)
+    docker = FakeDocker(fail_commands={"&& pytest": None})
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+
+    record = create(experiment)
+
+    assert record["status"] == "ok"
+    assert record["tests_passed"] is False  # the standard for its own children
+    tests_check = record["gate"]["checks"][1]
+    assert tests_check["passed"] is True
+    assert "already did for the parent" in tests_check["note"]
+    assert len(docker.gate_runs()) == 1  # the parent's result was on record
+
+
+def test_parents_tests_are_run_when_their_result_is_unknown(experiment, monkeypatch):
+    # e.g. a parent from before the gate existed
+    assert "tests_passed" not in runner.read_lineage(experiment / "agent_0")
+    docker = FakeDocker(fail_commands={"&& pytest": None})
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+
+    record = create(experiment)
+
+    assert record["status"] == "ok"
+    child_run, parent_run = docker.gate_runs()
+    assert f"{experiment / 'agent_0' / 'agent_code'}:/mnt/agent_code:ro" in parent_run
+    assert "sica_sandbox:run1_agent0" in parent_run  # in the parent's own image
+    # Recorded, so that it is not run again for the next child
+    assert runner.read_lineage(experiment / "agent_0")["tests_passed"] is False
+
+
+def test_meta_agent_gets_to_fix_an_agent_that_fails_the_gate(experiment, monkeypatch):
+    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    docker = FakeDocker(fail_commands={"&& pytest": 1})  # fails once, then passes
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+
+    record = create_with_gate(experiment, GateConfig(retries=2))
+
+    assert record["status"] == "ok"
+    assert record["gate"] == {**record["gate"], "passed": True, "fix_attempts": 1}
+    (fix_cmd,) = docker.commands_containing("archive.agent_0.agent_code.agent")
+    prompt = fix_cmd[fix_cmd.index("--prompt") + 1]
+    assert "'tests'" in prompt and "pytest went wrong" in prompt
+    assert fix_cmd[fix_cmd.index("--workdir") + 1] == "/home/agent/workdir"
+    assert fix_cmd[fix_cmd.index("--logdir") + 1] == "/home/agent/meta_improvement_logs_1/gate_fix_1"
+    # The fixed code is built and validated afresh
+    assert len(docker.calls_to("buildx")) == 2
+    assert len(docker.gate_runs()) == 2
+
+
+def test_fix_attempts_are_limited(experiment, monkeypatch):
+    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    docker = FakeDocker(fail_commands={"&& pytest": None})
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+
+    record = create_with_gate(experiment, GateConfig(retries=2))
+
+    assert record["status"] == "invalid"
+    assert record["gate"]["fix_attempts"] == 2
+    assert len(docker.commands_containing("archive.agent_0.agent_code.agent")) == 2
+    assert len(docker.gate_runs()) == 3
+
+
+def test_fix_uses_the_meta_model(experiment, monkeypatch):
+    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    docker = FakeDocker(fail_commands={"&& pytest": 1})
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+
+    create_with_gate(experiment, GateConfig(retries=1), child(meta_model="GPT4O"))
+
+    (fix_cmd,) = docker.commands_containing("archive.agent_0.agent_code.agent")
+    assert fix_cmd[:4] == ("docker", "exec", "-e", "AGENT_MODEL=GPT4O")
+
+
+def test_gate_can_be_switched_off(experiment, docker):
+    record = create_with_gate(experiment, GateConfig(checks=()))
+
+    assert record["status"] == "ok"
+    assert "gate" not in record
+    assert docker.gate_runs() == []
+
+
+def test_gate_container_failure_marks_the_agent_failed(experiment, monkeypatch):
+    docker = FakeDocker(fail_commands={"cp -r /mnt/agent_code": None})
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+
+    with pytest.raises(RuntimeError, match="Could not copy the agent code"):
+        create(experiment)
+
+    # Not 'invalid': the agent was never actually checked
+    assert runner.read_lineage(experiment / "agent_1")["status"] == "failed"
+    assert len(docker.calls_to("rm")) == 2
+
+
+def test_gate_command_timeout_is_a_failure(experiment, docker, monkeypatch):
+    async def run():
+        async def slow(*args):
+            if "exec" in args and "sleepy" in args:
+                await asyncio.sleep(5)
+            if "inspect" in args:
+                return True, '"running"', ""
+            return True, "", ""
+
+        monkeypatch.setattr(runner, "run_docker_command", slow)
+        async with runner.gate_container(1, 0, "image", experiment / "agent_0" / "agent_code") as exec:
+            return await exec("sleepy", timeout=0.05)
+
+    assert asyncio.run(run()) == (False, "", "Timed out after 0.05 seconds")
+
+
+def create_with_gate(exp_dir, gate, planned=None):
+    planned = planned or child()
+    asyncio.run(runner.run_meta_agent_benchmark(1, exp_dir, planned, gate))
+    return runner.read_lineage(exp_dir / f"agent_{planned['id']}")
+
+
+# The initial agent
+
+
+def check_initial(exp_dir, gate=GateConfig()):
+    asyncio.run(runner.check_initial_agent(1, exp_dir, gate))
+    return runner.read_lineage(exp_dir / "agent_0")
+
+
+def test_initial_agent_is_checked_once(experiment, docker):
+    record = check_initial(experiment)
+
+    assert record["gate"]["passed"] is True
+    assert record["tests_passed"] is True
+    (gate_run,) = docker.gate_runs()
+    assert f"{experiment / 'agent_0' / 'agent_code'}:/mnt/agent_code:ro" in gate_run
+
+    check_initial(experiment)
+    assert len(docker.gate_runs()) == 1
+
+
+@pytest.mark.parametrize("broken", ["import agent_code.agent", "agent_code benchmark"])
+def test_search_does_not_start_with_a_broken_setup(experiment, monkeypatch, broken):
+    steps = FakeSteps(monkeypatch, experiment)
+    monkeypatch.setattr(
+        runner, "run_docker_command", FakeDocker(fail_commands={broken: None})
+    )
+
+    with pytest.raises(RuntimeError, match="initial agent does not pass the validation gate"):
+        search(experiment, iterations=2)
+
+    assert steps.events == []  # nothing was spent
+    assert "gate" not in runner.read_lineage(experiment / "agent_0")
+
+
+def test_failing_tests_of_the_initial_agent_set_the_standard(experiment, monkeypatch):
+    monkeypatch.setattr(
+        runner, "run_docker_command", FakeDocker(fail_commands={"&& pytest": None})
+    )
+
+    record = check_initial(experiment)
+
+    assert record["gate"]["passed"] is True
+    assert record["tests_passed"] is False
+
+
+def test_initial_agent_is_not_checked_when_the_gate_is_off(experiment, docker):
+    check_initial(experiment, GateConfig(checks=()))
+    assert docker.calls == []
+
+
+def test_search_passes_the_gate_config_on(experiment, monkeypatch):
+    seen = []
+    steps = FakeSteps(monkeypatch, experiment)
+
+    async def create_recording(exp_id, exp_dir, planned, gate=None):
+        seen.append(gate)
+        await steps.create(exp_id, exp_dir, planned)
+
+    monkeypatch.setattr(runner, "run_meta_agent_benchmark", create_recording)
+    gate = GateConfig(checks=("import",), retries=3)
+
+    asyncio.run(runner.run_search(1, experiment, 1, 2, gate=gate))
+
+    assert seen == [gate]
+    assert runner.read_lineage(experiment / "agent_0")["gate"]["checks"] == [
+        {"name": "import", "passed": True, "command": "python -c 'import agent_code.agent'"}
+    ]
+
+
+def test_invalid_agents_are_not_evaluated(experiment, monkeypatch):
+    steps = FakeSteps(monkeypatch, experiment)
+
+    async def create(exp_id, exp_dir, planned, gate=None):
+        status = "invalid" if planned["id"] == 2 else "ok"
+        make_agent(exp_dir, planned["id"], planned["parent_id"], status=status)
+
+    monkeypatch.setattr(runner, "run_meta_agent_benchmark", create)
+
+    search(experiment, iterations=2, n_children=2)
+
+    assert [e for e in steps.events if e[0] == "evaluate"] == [("evaluate", 0), ("evaluate", 1)]
+    # And on resumption it counts as created: it is not made again
+    assert runner.load_metadata(experiment)["generation"] == 2
+
+
+def test_gate_cli_arguments():
+    parser = runner.setup_argparse()
+    args = parser.parse_args([])
+    assert (args.gate_checks, args.gate_retries, args.gate_model) == ("import,tests,smoke", 0, None)
+    args = parser.parse_args(
+        ["--gate-checks", "import,smoke", "--gate-retries", "2", "--gate-model", "GPT4O_MINI"]
+    )
+    assert GateConfig.parse_checks(args.gate_checks) == ("import", "smoke")
+    assert (args.gate_retries, args.gate_model) == (2, "GPT4O_MINI")
+    assert GateConfig.parse_checks(parser.parse_args(["--gate-checks", "none"]).gate_checks) == ()

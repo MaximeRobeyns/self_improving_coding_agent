@@ -120,6 +120,13 @@ By default the best-scoring agent carries out each improvement. `--meta-agent` c
 python runner.py --meta-agent seed --meta-model SONNET_37
 ```
 
+Before a new agent is evaluated it has to pass a validation gate, run in its own sandbox: its code imports, its unit tests pass (unless its parent's did not either), and it solves a trivial problem end to end. An agent that does not is marked `invalid`, and is neither evaluated nor built upon. The initial agent is checked once when a run starts, so that a broken setup is noticed before anything is spent.
+```bash
+python runner.py --gate-retries 1         # let the meta agent try to fix an agent that fails the gate
+python runner.py --gate-checks import     # only some of the checks (import, tests, smoke)
+python runner.py --gate-checks none       # no gate
+```
+
 Scores on a handful of problems are noisy, and three options make the evaluation more trustworthy or cheaper:
 ```bash
 python runner.py --repeats 3            # run every problem 3 times and average

@@ -16,6 +16,7 @@ import argparse
 import subprocess
 
 from uuid import uuid4
+from contextlib import asynccontextmanager
 from typing import Type
 from pathlib import Path
 from datetime import datetime
@@ -31,7 +32,9 @@ from base_agent.src.utils.archive_analysis import (
 from base_agent.src.utils.lineage import (
     STATUS_OK,
     STATUS_FAILED,
+    STATUS_INVALID,
     STATUS_PENDING,
+    FINISHED_STATUSES,
     read_lineage,
     write_lineage,
     child_generation,
@@ -49,6 +52,14 @@ from search.selection import (
     selection_rng,
 )
 from search.changelog import render_other_branches, update_change_log
+from search.gate import (
+    AGENT_CODE_DIR,
+    GateConfig,
+    GateResult,
+    check_tests,
+    fix_prompt,
+    run_gate,
+)
 from search.evaluation import (
     EvaluationConfig,
     holdout_dir,
@@ -69,6 +80,11 @@ benchmark_locks = {}
 # The image that agents run in. Agents made during an experiment get an image
 # of their own, tagged SANDBOX_IMAGE:run{exp_id}_agent{agent_id}.
 SANDBOX_IMAGE = "sica_sandbox"
+
+# Limits for the meta agent when it is asked to fix an agent that failed the
+# validation gate
+GATE_FIX_TIMEOUT_SECONDS = 30 * 60
+GATE_FIX_COST_THRESHOLD_USD = 5.0
 
 # The agent's monitoring web server listens on this port inside the container
 MONITOR_CONTAINER_PORT = 8080
@@ -139,6 +155,27 @@ def setup_argparse() -> argparse.ArgumentParser:
         metavar="MODEL",
         help="Model that the meta agent uses while improving an agent (default: the "
         "meta agent's own configured model). Benchmarks are unaffected.",
+    )
+    parser.add_argument(
+        "--gate-checks",
+        default="import,tests,smoke",
+        metavar="CHECKS",
+        help="Checks that a new agent must pass before it is evaluated, comma separated: "
+        "import (its code imports), tests (its unit tests pass, unless its parent's "
+        "did not either), smoke (it solves a trivial problem). 'none' switches the "
+        "gate off (default: import,tests,smoke)",
+    )
+    parser.add_argument(
+        "--gate-retries",
+        type=int,
+        default=0,
+        help="How often the meta agent is asked to fix a new agent that fails the gate (default: 0)",
+    )
+    parser.add_argument(
+        "--gate-model",
+        choices=[model.name for model in Model],
+        metavar="MODEL",
+        help="Model for the gate's smoke run (default: the agent's own configured model)",
     )
     parser.add_argument(
         "--repeats",
@@ -957,6 +994,130 @@ async def build_agent_image(tag: str, agent_code_dir: Path) -> tuple[bool, str]:
     return success, stderr
 
 
+def parse_usage(stdout: str) -> dict | None:
+    """The usage that an agent reports on the last line of its output, as
+    'tokens|cached tokens|cost|duration', or None if it is not there."""
+    try:
+        tokens, cached, cost, time = stdout.splitlines()[-1].split("|")
+        return {
+            "tokens": int(tokens),
+            "cached_tokens": int(cached),
+            "cost": float(cost),
+            "time": float(time),
+        }
+    except (IndexError, ValueError):
+        return None
+
+
+# Validation gate --------------------------------------------------------------
+
+
+@asynccontextmanager
+async def gate_container(exp_id: int, agent_id: int, image: str, agent_code_dir: Path):
+    """A throwaway container holding a copy of an agent's code at
+    AGENT_CODE_DIR. Yields a function that runs a command in it."""
+    name = f"sica_run_{exp_id}_agent_{agent_id}_gate_{uuid4().hex[:8]}"
+    try:
+        # The code is copied rather than mounted read-write: the checks leave
+        # caches and other files behind, which must not end up in the agent
+        success, _, stderr = await run_docker_command(
+            "docker", "run", "--rm", "-d", "--name", name,
+            "-v", f"{agent_code_dir.absolute()}:/mnt/agent_code:ro",
+            image, "tail", "-f", "/dev/null",
+        )  # fmt: skip
+        if not success:
+            raise RuntimeError(f"Could not start the validation container: {stderr}")
+        await wait_for_container_ready(name)
+        success, _, stderr = await run_docker_command(
+            "docker", "exec", name, "cp", "-r", "/mnt/agent_code", AGENT_CODE_DIR
+        )
+        if not success:
+            raise RuntimeError(f"Could not copy the agent code for validation: {stderr}")
+
+        async def exec(
+            *cmd: str, env: dict[str, str] | None = None, timeout: float | None = None
+        ) -> tuple[bool, str, str]:
+            docker_cmd = ["docker", "exec"]
+            for key, value in (env or {}).items():
+                docker_cmd += ["-e", f"{key}={value}"]
+            try:
+                async with asyncio.timeout(timeout):
+                    return await run_docker_command(*docker_cmd, name, *cmd)
+            except asyncio.TimeoutError:
+                return False, "", f"Timed out after {timeout} seconds"
+
+        yield exec
+    finally:
+        await run_docker_command("docker", "rm", "-f", name)
+
+
+async def agent_tests_pass(exp_id: int, exp_dir: Path, agent_id: int) -> bool | None:
+    """Whether an agent's own unit tests pass in its sandbox. Taken from its
+    lineage record if known, and otherwise run now and recorded."""
+    agent_dir = exp_dir / f"agent_{agent_id}"
+    known = (read_lineage(agent_dir) or {}).get("tests_passed")
+    if known is not None:
+        return known
+    image = await resolve_agent_image(exp_id, agent_id)
+    async with gate_container(exp_id, agent_id, image, agent_dir / "agent_code") as exec:
+        check = await check_tests(exec)
+    write_lineage(agent_dir, tests_passed=check.raw_passed)
+    return check.raw_passed
+
+
+async def validate_agent(
+    exp_id: int, exp_dir: Path, agent_id: int, gate: GateConfig, image: str
+) -> GateResult:
+    """Run the validation gate on an agent, in the given image."""
+    agent_dir = exp_dir / f"agent_{agent_id}"
+    parent_id = (read_lineage(agent_dir) or {}).get("parent_id")
+
+    async def parent_tests_pass() -> bool | None:
+        if parent_id is None:
+            return None
+        return await agent_tests_pass(exp_id, exp_dir, parent_id)
+
+    async with gate_container(exp_id, agent_id, image, agent_dir / "agent_code") as exec:
+        return await run_gate(exec, gate, parent_tests_pass)
+
+
+async def check_initial_agent(exp_id: int, exp_dir: Path, gate: GateConfig) -> None:
+    """Run the validation gate on the initial agent, once per experiment.
+
+    If even the initial agent does not get through, the setup is at fault
+    (image, API keys) and every agent made from it would be thrown out, each
+    at the cost of a meta-improvement step. Its unit tests are the exception:
+    they set the standard for its descendants rather than having to pass.
+
+    Raises:
+        RuntimeError: if the initial agent does not pass the gate
+    """
+    agent_dir = exp_dir / "agent_0"
+    if not gate.enabled or (read_lineage(agent_dir) or {}).get("gate") is not None:
+        return
+    logger.info("Checking that the initial agent passes the validation gate")
+
+    async def no_standard_yet() -> bool:
+        return False
+
+    image = await resolve_agent_image(exp_id, 0)
+    async with gate_container(exp_id, 0, image, agent_dir / "agent_code") as exec:
+        result = await run_gate(exec, gate, no_standard_yet)
+    if not result.passed:
+        raise RuntimeError(
+            "The initial agent does not pass the validation gate, so no agent made "
+            "from it would. Check the setup (is the sandbox image built, are the API "
+            "keys exported?), or switch the gate off with --gate-checks none.\n"
+            f"{result.failure_reason()}"
+        )
+    write_lineage(agent_dir, gate=result.to_dict(), tests_passed=result.tests_passed)
+    if result.tests_passed is False:
+        logger.warning(
+            "The unit tests of the initial agent fail in the sandbox; new agents "
+            "will not be required to pass theirs"
+        )
+
+
 def set_aside(exp_dir: Path, agent_dir: Path) -> None:
     """Move the remains of an interrupted meta-improvement out of the way
     (to `_interrupted/`), so that the agent can be created afresh."""
@@ -967,7 +1128,9 @@ def set_aside(exp_dir: Path, agent_dir: Path) -> None:
     shutil.move(str(agent_dir), str(target))
 
 
-async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> None:
+async def run_meta_agent_benchmark(
+    exp_id: int, exp_dir: Path, child: dict, gate: GateConfig = GateConfig()
+) -> None:
     """Create a new agent version from an archived one
 
     We can conceptually think of this as a 'meta agent improvement' benchmark.
@@ -979,6 +1142,7 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
             `parent_id` whose code it starts from, the `meta_agent_id` that
             makes the changes (using `meta_model`, if given), and the
             `selection` record of the parent choice
+        gate: The validation that the new agent has to pass to be usable
     """
     child_id: int = child["id"]
     parent_id: int = child["parent_id"]
@@ -993,13 +1157,14 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
 
     if child_dir.exists():
         existing = read_lineage(child_dir) or {}
-        if existing.get("status") in (STATUS_OK, STATUS_FAILED):
+        if existing.get("status") in FINISHED_STATUSES:
             raise ValueError(f"Agent {child_id} has already been created")
         set_aside(exp_dir, child_dir)
     child_dir.mkdir(parents=True)
 
     # Record where the new agent comes from. It stays 'pending' until the meta
-    # agent has run, and is marked 'failed' if it does not complete.
+    # agent has run, and is marked 'failed' if it does not complete, or
+    # 'invalid' if what it made cannot run.
     write_lineage(
         child_dir,
         id=child_id,
@@ -1081,37 +1246,72 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
             failure_reason = f"Meta agent exited with an error: {stderr[-2000:]}"
             return
 
-        # 5. Build the new agent's image, with its (possibly changed)
-        # requirements.txt. An agent whose image does not build cannot run.
-        built, build_stderr = await build_agent_image(
-            agent_image_tag(exp_id, child_id), child_code_dir
+        # What it took to create this agent, for cost accounting
+        usage = parse_usage(stdout)
+        if usage is None:
+            logger.warning(f"Meta agent reported no usage for agent {child_id}")
+            usage = {"tokens": 0, "cached_tokens": 0, "cost": 0.0, "time": 0.0}
+        else:
+            write_lineage(child_dir, usage=usage)
+        tokens, cached, cost, time = (
+            usage["tokens"], usage["cached_tokens"], usage["cost"], usage["time"]
+        )  # fmt: skip
+        percent_cached = cached / tokens * 100 if tokens > 0 else 0
+        logger.info(
+            f"meta-improvement (agent {child_id}) || tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${cost:.4f}, duration: {time:.2f}s"
         )
-        if not built:
-            logger.error(f"Image build failed for agent {child_id}: {build_stderr}")
-            failure_reason = f"Image build failed: {build_stderr[-2000:]}"
-            return
 
-        # The agent is usable; anything that goes wrong from here on (usage
-        # statistics, summaries) does not invalidate it.
+        fix_attempts = 0
+        while True:
+            # 5. Build the new agent's image, with its (possibly changed)
+            # requirements.txt. An agent whose image does not build cannot run.
+            image_tag = agent_image_tag(exp_id, child_id)
+            built, build_stderr = await build_agent_image(image_tag, child_code_dir)
+            if not built:
+                logger.error(f"Image build failed for agent {child_id}: {build_stderr}")
+                failure_reason = f"Image build failed: {build_stderr[-2000:]}"
+                return
+
+            # 6. Validate it: an agent that cannot run is not worth evaluating
+            if not gate.enabled:
+                break
+            result = await validate_agent(exp_id, exp_dir, child_id, gate, image_tag)
+            write_lineage(
+                child_dir,
+                gate={**result.to_dict(), "fix_attempts": fix_attempts},
+                tests_passed=result.tests_passed,
+            )
+            if result.passed:
+                break
+            logger.error(f"Agent {child_id}: {result.failure_reason()}")
+            if fix_attempts >= gate.retries:
+                status = STATUS_INVALID
+                failure_reason = result.failure_reason()
+                return
+
+            # Ask the meta agent to repair what it made, then build and
+            # validate again
+            fix_attempts += 1
+            logger.info(
+                f"Asking the meta agent to fix agent {child_id} (attempt {fix_attempts} of {gate.retries})"
+            )
+            fix_cmd = ["python", "-m", f"{agent_module}.agent"]
+            fix_cmd += ["--prompt", fix_prompt(result)]
+            fix_cmd += ["--workdir", "/home/agent/workdir"]
+            fix_cmd += ["--logdir", f"{container_meta_log_path}/gate_fix_{fix_attempts}"]
+            fix_cmd += ["--timeout", str(GATE_FIX_TIMEOUT_SECONDS)]
+            fix_cmd += ["--cost-threshold", str(GATE_FIX_COST_THRESHOLD_USD)]
+            fixed, _, fix_stderr = await run_docker_command(
+                *exec_cmd, container_name, *fix_cmd
+            )
+            if not fixed:
+                logger.warning(f"The fix attempt for agent {child_id} errored: {fix_stderr}")
+
+        # The agent is usable; anything that goes wrong from here on
+        # (summaries) does not invalidate it.
         status, failure_reason = STATUS_OK, None
 
-        tokens, cached, cost, time = stdout.splitlines()[-1].split("|")
-        percent_cached = int(cached) / int(tokens) * 100 if int(tokens) > 0 else 0
-        # What it took to create this agent, for cost accounting
-        write_lineage(
-            child_dir,
-            usage={
-                "tokens": int(tokens),
-                "cached_tokens": int(cached),
-                "cost": float(cost),
-                "time": float(time),
-            },
-        )
-        logger.info(
-            f"meta-improvement (agent {child_id}) || tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
-        )
-
-        # 6. Generate and save a summary for the meta-improvement logs
+        # 7. Generate and save a summary for the meta-improvement logs
         trace_path = meta_log_dir / "execution_tree.txt"
         if trace_path.exists():
             trace = trace_path.read_text()
@@ -1129,7 +1329,7 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
         meta_context = (
             f"The 'answer' actually pertains to whether the agent was successful (1) or errored out (0) during the meta-improvement task"
             f"Meta-improvement process used {tokens} tokens ({percent_cached:.2f}% cached), "
-            f"cost ${float(cost):.4f}, and took {float(time):.2f} seconds."
+            f"cost ${cost:.4f}, and took {time:.2f} seconds."
         )
         if stderr:
             meta_context += f"\nErrors encountered: {stderr}"
@@ -1168,7 +1368,7 @@ async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> N
             # Left 'pending', so that it is created afresh on resumption
             logger.warning(f"Creation of agent {child_id} was interrupted")
         else:
-            logger.error(f"Marking agent {child_id} as failed: {failure_reason}")
+            logger.error(f"Marking agent {child_id} as {status}: {failure_reason}")
             write_lineage(child_dir, status=status, failure_reason=failure_reason)
 
 
@@ -1211,7 +1411,7 @@ def set_aside_incomplete_agents(exp_dir: Path) -> None:
     for agent_id in get_agent_ids(exp_dir):
         agent_dir = exp_dir / f"agent_{agent_id}"
         record = read_lineage(agent_dir) or {}
-        if record.get("status") not in (STATUS_OK, STATUS_FAILED):
+        if record.get("status") not in FINISHED_STATUSES:
             set_aside(exp_dir, agent_dir)
 
 
@@ -1432,11 +1632,14 @@ async def run_search(
     config: EvaluationConfig = EvaluationConfig(),
     meta_agent: str | int = "best",
     meta_model: str | None = None,
+    gate: GateConfig = GateConfig(),
 ) -> None:
     """The self-improvement loop. In each generation: evaluate the agents that
     have not been evaluated yet, then create `n_children` new agents."""
     start_generation = load_search_state(exp_dir)["generation"]
     logger.info(f"Starting from generation {start_generation}")
+    if start_generation < iterations:
+        await check_initial_agent(exp_id, exp_dir, gate)
 
     for generation in range(start_generation, iterations):
         await evaluate_pending_agents(exp_id, exp_dir, workers, config)
@@ -1452,7 +1655,7 @@ async def run_search(
 
         def is_created(child: dict) -> bool:
             record = read_lineage(exp_dir / f"agent_{child['id']}") or {}
-            return record.get("status") in (STATUS_OK, STATUS_FAILED)
+            return record.get("status") in FINISHED_STATUSES
 
         todo = [child for child in plan if not is_created(child)]
         logger.info(
@@ -1460,7 +1663,7 @@ async def run_search(
             f"from parents {[c['parent_id'] for c in todo]}"
         )
         results = await asyncio.gather(
-            *(run_meta_agent_benchmark(exp_id, exp_dir, child) for child in todo),
+            *(run_meta_agent_benchmark(exp_id, exp_dir, child, gate) for child in todo),
             return_exceptions=True,
         )
         errors = [r for r in results if isinstance(r, BaseException)]
@@ -1571,6 +1774,15 @@ async def main():
     logger.info(
         f"Meta agent: {args.meta_agent}, model: {args.meta_model or 'its own default'}"
     )
+    try:
+        gate = GateConfig(
+            checks=GateConfig.parse_checks(args.gate_checks),
+            retries=args.gate_retries,
+            model=args.gate_model,
+        )
+    except ValueError as e:
+        parser.error(str(e))
+    logger.info(f"Validation gate: {gate}")
     await run_search(
         exp_id,
         exp_dir,
@@ -1582,6 +1794,7 @@ async def main():
         config=config,
         meta_agent=args.meta_agent,
         meta_model=args.meta_model,
+        gate=gate,
     )
 
 

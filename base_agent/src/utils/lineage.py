@@ -22,7 +22,11 @@ LINEAGE_FILENAME = "lineage.json"
 
 STATUS_PENDING = "pending"  # meta-improvement started but has not finished
 STATUS_OK = "ok"
-STATUS_FAILED = "failed"
+STATUS_FAILED = "failed"  # the meta-improvement step did not complete
+STATUS_INVALID = "invalid"  # the agent was made, but cannot run (validation gate)
+
+# Statuses of agents whose creation has come to an end, one way or another
+FINISHED_STATUSES = (STATUS_OK, STATUS_FAILED, STATUS_INVALID)
 
 
 def read_lineage(agent_dir: str | Path) -> dict | None:

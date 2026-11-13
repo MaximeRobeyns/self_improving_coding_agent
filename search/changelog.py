@@ -57,6 +57,8 @@ def render_other_branches(analyzer: ArchiveAnalyzer, parent_id: int) -> str | No
         agent_id, agent_parent = record["id"], record["parent_id"]
         if record.get("status") == "failed":
             outcome = "failed to build"
+        elif record.get("status") == "invalid":
+            outcome = "did not pass validation (the code could not run)"
         else:
             delta = paired_delta(scores_df, agent_id, agent_parent)
             outcome = f"vs parent: {delta}" if delta else "not evaluated yet"

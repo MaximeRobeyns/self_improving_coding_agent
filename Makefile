@@ -12,8 +12,9 @@ int:  ## Interactive run; uses default shell entrypoint
 		-v ${PWD}/results/interactive_output:/home/agent/workdir:rw \
 		sica_sandbox
 
-test:  ## Run the unit tests for the agent
+test:  ## Run the unit tests for the agent and the runner
 	@pytest base_agent
+	@pytest tests
 
 image:  ## Docker image for x86_64
 	@ANTHROPIC_API_KEY=$${ANTHROPIC_API_KEY:-placeholder_anthropic_api_key} \

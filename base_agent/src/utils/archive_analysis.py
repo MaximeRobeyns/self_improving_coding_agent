@@ -13,9 +13,37 @@ from typing import Dict, Optional, Union, List, Any, Literal, Tuple
 from dataclasses import dataclass
 from tabulate import tabulate
 
+from .lineage import STATUS_OK, read_lineage
+
 logger = logging.getLogger(__name__)
 
 ScoreType = Literal["mean_score", "utility_score"]
+
+
+def result_id(problem_id: str, repeat: int = 0) -> str:
+    """The id under which a run of a problem is stored. The first run keeps
+    the problem id itself, so that single runs look as they always did."""
+    return problem_id if repeat == 0 else f"{problem_id}#{repeat}"
+
+
+def base_problem_id(stored_id: str, repeat: int = 0) -> str:
+    """The id of the problem that a stored result is a run of."""
+    suffix = f"#{repeat}"
+    if repeat and stored_id.endswith(suffix):
+        return stored_id[: -len(suffix)]
+    return stored_id
+
+
+def per_problem_scores(scores_df: pd.DataFrame, score_key: str = "score") -> pd.DataFrame:
+    """One row per (iteration, benchmark, problem), averaging repeated runs.
+
+    Repeated runs of a problem are not independent observations of an agent's
+    score, so statistics over problems must be computed on these means.
+    """
+    keys = ["iteration", "benchmark", "problem_id"]
+    if scores_df.empty or not set(keys) <= set(scores_df.columns):
+        return scores_df
+    return scores_df.groupby(keys, sort=False)[score_key].mean().reset_index()
 
 
 def read_jsonl(file_path: Path) -> List[Dict]:
@@ -288,8 +316,70 @@ class ArchiveAnalyzer:
             df.set_index("iteration", inplace=True, drop=False)
         return df
 
-    def get_best_agent_iteration(self) -> int:
+    def get_lineage(self) -> Dict[int, Dict[str, Any]]:
+        """The lineage record of every agent in the archive, by iteration.
+
+        Each record has at least `id`, `parent_id` (the agent whose code this
+        one started from), `meta_agent_id` (the agent that made the changes),
+        `status` and `generation`. Agents without a stored record (the root
+        agent of older archives, say) get one with unknown ancestry.
+        """
+        lineage: Dict[int, Dict[str, Any]] = {}
+        for agent_dir in self.archive_root.glob("agent_*"):
+            if not agent_dir.is_dir():
+                continue
+            try:
+                iteration = int(agent_dir.name.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            record: Dict[str, Any] = {
+                "id": iteration,
+                "parent_id": None,
+                "meta_agent_id": None,
+                "status": STATUS_OK,
+                "generation": 0 if iteration == 0 else None,
+            }
+            record.update(read_lineage(agent_dir) or {})
+            lineage[iteration] = record
+        return dict(sorted(lineage.items()))
+
+    def get_children(self, iteration: int) -> List[int]:
+        """Iterations whose code started from the given iteration."""
+        return [
+            i
+            for i, record in self.get_lineage().items()
+            if record["parent_id"] == iteration
+        ]
+
+    def get_ancestors(self, iteration: int) -> List[int]:
+        """The chain of parents of an iteration, nearest first, up to the root."""
+        lineage = self.get_lineage()
+        ancestors: List[int] = []
+        seen = {iteration}
+        current = lineage.get(iteration, {}).get("parent_id")
+        while current is not None and current in lineage and current not in seen:
+            ancestors.append(current)
+            seen.add(current)
+            current = lineage[current]["parent_id"]
+        return ancestors
+
+    def paired_delta(
+        self,
+        iteration: int,
+        baseline: int,
+        score_type: ScoreType = "mean_score",
+    ) -> Optional["PairedDelta"]:
+        """How much better `iteration` scores than `baseline` on the problems
+        both were run on, with a confidence interval. See `paired_delta`."""
+        scores_df, _ = self.get_problem_scores_by_iteration()
+        return paired_delta(scores_df, iteration, baseline, score_type=score_type)
+
+    def get_best_agent_iteration(self, exclude: set[int] | None = None) -> int:
+        """The iteration with the best mean benchmark score, ignoring any
+        iterations in `exclude`."""
         df = self.analyze_run()
+        if exclude:
+            df = df[~df["iteration"].isin(exclude)].copy()
 
         # Get all benchmark score columns (excluding utility_score)
         score_cols = [
@@ -321,14 +411,27 @@ class ArchiveAnalyzer:
 
         # Create summary table
         summary_data = []
+        lineage = self.get_lineage()
+        scores_df, _ = self.get_problem_scores_by_iteration()
         headers = (
-            ["Iteration"]
+            ["Iteration", "Parent", "vs Parent"]
             + [col.replace("_score", "") for col in score_cols]
             + ["Utility", "Avg Cost", "Avg Time", "Avg Tokens", "Avg Cached Tokens"]
         )
 
         for _, row in df.iterrows():
-            summary_row = [row["iteration"]]
+            iteration = int(row["iteration"])
+            parent_id = lineage.get(iteration, {}).get("parent_id")
+            delta = (
+                None
+                if parent_id is None
+                else paired_delta(scores_df, iteration, parent_id)
+            )
+            summary_row = [
+                iteration,
+                "-" if parent_id is None else parent_id,
+                "-" if delta is None else str(delta),
+            ]
             summary_row.extend([f"{row[col]:.3f}" for col in score_cols])
             summary_row.extend(
                 [
@@ -341,7 +444,14 @@ class ArchiveAnalyzer:
             )
             summary_data.append(summary_row)
 
-        return tabulate(summary_data, headers=headers, tablefmt="pipe", floatfmt=".3f")
+        table = tabulate(
+            summary_data,
+            headers=headers,
+            tablefmt="pipe",
+            floatfmt=".3f",
+            disable_numparse=True,
+        )
+        return f"{table}\n\n{PAIRED_DELTA_LEGEND.format(column='vs Parent')}"
 
     def get_agent_description(self, iteration: int) -> str:
         """Get formatted description for a specific agent iteration."""
@@ -600,6 +710,21 @@ class ArchiveAnalyzer:
         headers = ["Metric"] + [f"Iteration {i}" for i in iterations]
         output.append(tabulate(comparison_data, headers=headers, tablefmt="pipe"))
 
+        # Add paired differences between each pair of iterations
+        scores_df, _ = self.get_problem_scores_by_iteration()
+        paired_lines = []
+        for n, baseline in enumerate(iterations):
+            for iteration in iterations[n + 1 :]:
+                delta = paired_delta(scores_df, iteration, baseline)
+                if delta is not None:
+                    paired_lines.append(
+                        f"Iteration {iteration} vs {baseline}: {delta} ({delta.n_problems} shared problems)"
+                    )
+        if paired_lines:
+            output.append("\nPaired Score Differences:")
+            output.extend(paired_lines)
+            output.append(PAIRED_DELTA_LEGEND.format(column="Each line"))
+
         return "\n".join(output)
 
     def get_improvement_trend(self) -> pd.DataFrame:
@@ -750,10 +875,14 @@ class ArchiveAnalyzer:
                                 timed_out=timed_out,
                             ).utility()
 
+                            repeat = result.get("repeat", 0) or 0
                             score_data = {
                                 "iteration": iteration,
                                 "benchmark": bench_dir.name,
-                                "problem_id": result["problem_id"],
+                                "problem_id": base_problem_id(
+                                    result["problem_id"], repeat
+                                ),
+                                "repeat": repeat,
                                 "score": score,
                                 "utility": problem_utility,
                                 "tokens_used": tokens,
@@ -775,6 +904,108 @@ class ArchiveAnalyzer:
             return pd.DataFrame(), pd.DataFrame()
 
         return scores_df, summaries_df
+
+
+PAIRED_DELTA_LEGEND = (
+    "{column}: score difference on the problems both agents were run on, "
+    "with its 95% confidence interval. * marks a difference that is "
+    "distinguishable from run-to-run noise (the interval excludes 0)."
+)
+
+
+@dataclass(frozen=True)
+class PairedDelta:
+    """The score difference between two agents on their shared problems."""
+
+    mean: float
+    ci_lower: float
+    ci_upper: float
+    n_problems: int  # problems that both agents were run on
+    n_benchmarks: int
+
+    @property
+    def significant(self) -> bool:
+        """Whether the confidence interval excludes zero."""
+        if self.n_problems < 2:
+            return False  # a single problem says nothing about variability
+        return self.ci_lower > 0 or self.ci_upper < 0
+
+    def __str__(self) -> str:
+        text = f"{self.mean:+.3f} [{self.ci_lower:+.3f}, {self.ci_upper:+.3f}]"
+        return f"{text} *" if self.significant else text
+
+
+def paired_delta(
+    scores_df: pd.DataFrame,
+    iteration: int,
+    baseline: int,
+    score_type: ScoreType = "mean_score",
+    n_resamples: int = 2000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> Optional[PairedDelta]:
+    """Score of `iteration` minus score of `baseline`, on shared problems.
+
+    Agents are evaluated on the same problems, and problems differ a lot in
+    difficulty. Comparing the two agents problem by problem removes that
+    shared variation, which gives a much tighter interval than comparing
+    their two independent confidence intervals.
+
+    The difference is the mean over benchmarks of the mean per-problem
+    difference (matching how the overall score weights benchmarks), and the
+    interval is a percentile bootstrap that resamples problems within each
+    benchmark. Repeated runs of a problem are averaged first.
+
+    Args:
+        scores_df: Problem scores, from `get_problem_scores_by_iteration`
+        iteration: The agent being assessed
+        baseline: The agent it is compared against
+        score_type: Whether to compare raw scores or utility
+        n_resamples: Number of bootstrap resamples
+        confidence: Coverage of the interval
+        seed: Seed of the bootstrap, making the result reproducible
+
+    Returns:
+        None if the two agents have no problems in common.
+    """
+    if scores_df.empty:
+        return None
+    score_key = "score" if score_type == "mean_score" else "utility"
+
+    selected = scores_df[scores_df["iteration"].isin([iteration, baseline])]
+    per_problem = (
+        selected.groupby(["benchmark", "problem_id", "iteration"])[score_key]
+        .mean()
+        .unstack("iteration")
+    )
+    if iteration not in per_problem.columns or baseline not in per_problem.columns:
+        return None
+    differences = (per_problem[iteration] - per_problem[baseline]).dropna()
+    if differences.empty:
+        return None
+
+    rng = np.random.default_rng(seed)
+    by_benchmark = [
+        d.to_numpy(dtype=float) for _, d in differences.groupby(level="benchmark")
+    ]
+    mean = 0.0
+    resampled = np.zeros(n_resamples)
+    for values in by_benchmark:
+        mean += values.mean()
+        picks = rng.integers(0, len(values), size=(n_resamples, len(values)))
+        resampled += values[picks].mean(axis=1)
+    mean /= len(by_benchmark)
+    resampled /= len(by_benchmark)
+
+    tail = (1.0 - confidence) / 2.0
+    ci_lower, ci_upper = np.quantile(resampled, [tail, 1.0 - tail])
+    return PairedDelta(
+        mean=float(mean),
+        ci_lower=float(ci_lower),
+        ci_upper=float(ci_upper),
+        n_problems=len(differences),
+        n_benchmarks=len(by_benchmark),
+    )
 
 
 def compute_statistics(
@@ -805,7 +1036,10 @@ def compute_statistics(
     # Calculate score standard deviation and count from individual results
     score_key = "score" if score_type == "mean_score" else "utility"
     score_stats = (
-        scores_df.groupby("iteration")[score_key].agg(["std", "count"]).reset_index()
+        per_problem_scores(scores_df, score_key)
+        .groupby("iteration")[score_key]
+        .agg(["std", "count"])
+        .reset_index()
     )
 
     # Merge the statistics

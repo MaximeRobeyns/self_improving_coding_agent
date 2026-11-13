@@ -104,6 +104,41 @@ python runner.py --id 1 --workers 6
 
 This will start the agent loop, placing the results in `results/run_<id>`.
 
+By default each new agent is built from the latest agent that is not significantly worse than the best one (`greedy_ci`). Two sampling strategies are also available, which spread the search over more of the archive:
+```bash
+python runner.py --selection score_child_prop --seed 1  # favour high scores and agents with few children
+python runner.py --selection thompson --seed 1          # Thompson sampling over each agent's success rate
+```
+The parent, strategy, seed and selection probabilities of every agent are recorded in `results/run_<id>/agent_<i>/lineage.json`.
+
+To branch the search out, create several new agents per iteration, each from its own selected parent. They are created in parallel and then evaluated one after the other:
+```bash
+python runner.py --selection score_child_prop --children 3
+```
+By default the best-scoring agent carries out each improvement. `--meta-agent` changes that (`parent`: each new agent's own parent; `seed`: the initial agent; or a fixed agent id), and `--meta-model` makes it use another model for the improvement only, e.g. a stronger model building the scaffold that a weaker one is benchmarked with:
+```bash
+python runner.py --meta-agent seed --meta-model SONNET_37
+```
+
+Scores on a handful of problems are noisy, and three options make the evaluation more trustworthy or cheaper:
+```bash
+python runner.py --repeats 3            # run every problem 3 times and average
+python runner.py --holdout-fraction 0.3 # keep 30% of the problems out of the archive the agents see
+python runner.py --stage1-size 8        # try new agents on 8 problems per benchmark first
+```
+- With `--holdout-fraction`, results on the held-out problems go to `results/holdout/run_<id>/` (same layout as the experiment directory). Agents never see them, so a gain that shows up on the archive problems but not on the held-out ones is overfitting. The split can only be chosen when an experiment is started.
+- With `--stage1-size`, an agent that is clearly worse than its parent on the first-stage problems is not evaluated further and not built upon (`--promote-threshold` sets how much worse is tolerated).
+
+These settings are stored with the experiment and kept when it is resumed.
+
+To see how an experiment went (the tree of agents, progress and cost per generation, archive vs held-out scores, and how parents were selected), or how much several experiments differ from run to run:
+```bash
+python -m search.report results/run_1
+python -m search.report results/run_1 results/run_2 results/run_3
+```
+
+An interrupted run can be resumed with `--id <id>`: it continues with the agents that were planned, and moves the remains of any half-made agent to `results/run_<id>/_interrupted/`.
+
 ## Things to work on
 
 Here are some potential things to try and do with the agent framework:
@@ -176,7 +211,8 @@ results/run_{id}/
     │       ├── results.jsonl  # Per-problem results
     │       ├── perf.jsonl     # Summary metrics
     │       └── traces/        # Detailed traces
-    └── meta_improvement/  # Improvement logs
+    ├── lineage.json           # Parent, meta agent, status and how the parent was selected
+    └── meta_improvement_logs/ # Logs of the meta-improvement step that created this agent
 ```
 
 ## Citation

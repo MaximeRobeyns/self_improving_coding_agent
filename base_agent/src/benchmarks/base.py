@@ -35,6 +35,9 @@ class ProblemResult:
     wall_time: float | None = None
     timed_out: bool = False
     cost_threshold_exceeded: bool = False
+    # Which run of the problem this is, when problems are run more than once.
+    # The problem_id of runs after the first ends in '#<repeat>'.
+    repeat: int = 0
 
     def is_complete(self) -> bool:
         # Considered complete if it has been scored
@@ -61,9 +64,11 @@ class BenchmarkTracker:
                     results[line["problem_id"]] = ProblemResult(**line)
         return results
 
-    def start_problem(self, problem_id: str) -> None:
+    def start_problem(self, problem_id: str, repeat: int = 0) -> None:
         result = ProblemResult(
-            problem_id=problem_id, timestamp=datetime.now().isoformat()
+            problem_id=problem_id,
+            timestamp=datetime.now().isoformat(),
+            repeat=repeat,
         )
         self.results[problem_id] = result
         with jsonlines.open(self.results_path, mode="a") as writer:

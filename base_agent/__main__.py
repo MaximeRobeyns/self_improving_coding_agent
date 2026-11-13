@@ -161,7 +161,7 @@ You must focus on things like:
 
 You have an archive of benchmark data measuring the performance of this coding agent over time, the changes to which are documented in the agent_change_log.md file. This is your own code, although it is not live and running now: it will be for your next, improved version of yourself.
 
-The agent code in this directory is the best performing in the sequence of agent iterations, and corresponds to agent iteration {best_iter}. Other agent iterations may have had good elements however, and you can inspect the /home/agent/workdir/agent_change_log.md file to see which elements of past agents you might want to take forward and combine with the current best performing agent.
+The agent code in this directory is a copy of agent iteration {best_iter}, which was selected as the starting point for this improvement. Other agent iterations may have had good elements however, and you can inspect the /home/agent/workdir/agent_change_log.md file to see which elements of other agents you might want to take forward and combine with this one.
 
 Note that the archive of past agent iterations is mounted read-only as:
 /home/agent/archive/
@@ -181,7 +181,7 @@ Note that the archive of past agent iterations is mounted read-only as:
 │                   ├── trace.txt (full trace)
 │                   └── execution_tree.txt (concise trace)
 
-While you have the best performing agent in /home/agent/workdir, the file /home/agent/workdir/agent_change_log.md corresponds to the one from the last agent.
+The file /home/agent/workdir/agent_change_log.md is the change log of agent iteration {best_iter} and its ancestors: its entries describe changes that are present in this code. It may end with a generated section, 'Attempts on other branches', describing agents that were built from other starting points: their changes are NOT in this code. Leave that section as it is, and add your entry above it.
 
 You should first read the README at /home/agent/workdir/README.md, and the agent_change_log.md file because this contains some crucial project context. Make sure you've understood the code before starting.
 You should try to invoke the meta improvement reasoning structure as early as reasonably possible, and your procedure for this meta-improvement task should involve using the archive exploration tools available to you, coming up with a good feature or change to implement to improve the agent performance, and then carefully implementing this making the minimal required changes.

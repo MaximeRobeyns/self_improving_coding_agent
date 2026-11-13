@@ -25,12 +25,37 @@ from base_agent.src.benchmarks import benchmark_registry
 from base_agent.src.benchmarks.base import BaseBenchmark, BenchmarkTracker, Problem
 from base_agent.src.utils.archive_analysis import (
     ArchiveAnalyzer,
-    compute_statistics,
-    ScoreType,
+    base_problem_id,
+    result_id,
+)
+from base_agent.src.utils.lineage import (
+    STATUS_OK,
+    STATUS_FAILED,
+    STATUS_PENDING,
+    read_lineage,
+    write_lineage,
+    child_generation,
+    get_failed_iterations,
+    get_pruned_iterations,
 )
 from base_agent.src.llm.api import create_completion
 from base_agent.src.llm.base import Message
 from base_agent.src.types.llm_types import Model, TextContent
+from search.selection import (
+    DEFAULT_SELECTION_STRATEGY,
+    SELECTION_STRATEGIES,
+    ArchiveView,
+    get_selector,
+    selection_rng,
+)
+from search.changelog import render_other_branches, update_change_log
+from search.evaluation import (
+    EvaluationConfig,
+    holdout_dir,
+    should_promote,
+    split_problems,
+    stage1_problems,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -41,7 +66,35 @@ logger = logging.getLogger(__name__)
 benchmark_trackers = {}
 benchmark_locks = {}
 
+# The image that agents run in. Agents made during an experiment get an image
+# of their own, tagged SANDBOX_IMAGE:run{exp_id}_agent{agent_id}.
+SANDBOX_IMAGE = "sica_sandbox"
+
+# The agent's monitoring web server listens on this port inside the container
+MONITOR_CONTAINER_PORT = 8080
+# Publish it on a free host port chosen by docker (loopback only), so that any
+# number of containers can run concurrently without port collisions.
+MONITOR_PORT_MAPPING = f"127.0.0.1::{MONITOR_CONTAINER_PORT}"
+
 # Utility functions ------------------------------------------------------------
+
+
+META_AGENT_CHOICES = ("best", "parent", "seed")
+
+
+def parse_meta_agent(value: str) -> str | int:
+    """A --meta-agent value: one of META_AGENT_CHOICES, or an agent id"""
+    if value in META_AGENT_CHOICES:
+        return value
+    try:
+        agent_id = int(value)
+    except ValueError:
+        agent_id = -1
+    if agent_id < 0:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not one of {', '.join(META_AGENT_CHOICES)} or an agent id"
+        )
+    return agent_id
 
 
 def setup_argparse() -> argparse.ArgumentParser:
@@ -54,6 +107,61 @@ def setup_argparse() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--workers", type=int, default=8, help="Number of parallel problem workers"
+    )
+    parser.add_argument(
+        "--children",
+        type=int,
+        default=1,
+        help="Number of new agents to create per iteration, each from its own selected parent",
+    )
+    parser.add_argument(
+        "--selection",
+        choices=SELECTION_STRATEGIES,
+        default=DEFAULT_SELECTION_STRATEGY,
+        help="How to select the agent that the next agent is built from",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Seed for parent selection (default: the experiment's stored seed, or a new random one)",
+    )
+    parser.add_argument(
+        "--meta-agent",
+        type=parse_meta_agent,
+        default="best",
+        metavar="{best,parent,seed,<id>}",
+        help="Which agent carries out the improvement of a new agent: the best-scoring "
+        "agent (default), the new agent's parent, the initial agent, or a fixed agent id",
+    )
+    parser.add_argument(
+        "--meta-model",
+        choices=[model.name for model in Model],
+        metavar="MODEL",
+        help="Model that the meta agent uses while improving an agent (default: the "
+        "meta agent's own configured model). Benchmarks are unaffected.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        help="Number of times to run each benchmark problem (default: 1)",
+    )
+    parser.add_argument(
+        "--holdout-fraction",
+        type=float,
+        help="Share of each benchmark's problems to keep out of the archive that agents see; "
+        "can only be set when an experiment is started (default: 0)",
+    )
+    parser.add_argument(
+        "--stage1-size",
+        type=int,
+        help="Evaluate new agents on this many problems per benchmark first, and in full "
+        "only if they are not clearly worse than their parent (default: 0, always in full)",
+    )
+    parser.add_argument(
+        "--promote-threshold",
+        type=float,
+        help="With --stage1-size: evaluate in full unless the agent is worse than its "
+        "parent by more than this, at 95%% confidence (default: 0)",
     )
     subparsers = parser.add_subparsers(dest="command", help="Sub-command to perform")
 
@@ -85,68 +193,6 @@ def get_next_dir_number(base_dir: str | Path) -> int:
     return max(numbered_dirs) + 1
 
 
-def select_base_agent(
-    analyzer: ArchiveAnalyzer,
-    current_iteration: int,
-    score_type: ScoreType = "mean_score",
-) -> int:
-    """
-    Select which previous agent iteration to use as the base for improvement.
-
-    Args:
-        analyzer: ArchiveAnalyzer instance
-        current_iteration: The current iteration number
-        score_type: Utility score or mean score
-
-    Returns:
-        The iteration number to use as base for improvement
-    """
-    # Get performance data with utility scores
-    scores_df, summaries_df = analyzer.get_problem_scores_by_iteration()
-    # print(scores_df, summaries_df)
-    if scores_df.empty or summaries_df.empty:
-        return 0  # Default to first agent if no data
-
-    # Compute statistics including confidence intervals
-    stats = compute_statistics(scores_df, summaries_df, score_type=score_type)
-    # print(stats)
-    if stats.empty:
-        return 0
-
-    # Find the best performing iteration
-    # Mean score here corresponds to either utility_score or perf based on score_type
-    best_idx = stats["target_score"].idxmax()
-    best_stats = stats.loc[best_idx]
-
-    # Get the lower confidence bound of the best performing agent
-    best_lower_bound = best_stats["ci_lower"]
-
-    # Check each iteration from current back to best (or 0), looking for first
-    # agent that meets our criteria
-    for i in range(current_iteration, -1, -1):
-        if i not in stats.index:
-            continue
-
-        current_mean = stats.loc[i, "target_score"]
-        logger.info(
-            f"Agent {i} mean {score_type} score: {current_mean}; best lower bound: {best_lower_bound}"
-        )
-        if current_mean >= best_lower_bound:
-            return i
-
-        # If we've gone past the best iteration and haven't found a suitable
-        # agent, use the best
-        try:
-            if i <= best_idx:
-                return best_idx
-        except Exception as e:
-            logger.warning(e)
-            continue
-
-    logger.info("Defaulting to base agent iteration 0")
-    return 0  # Fallback to first agent if something goes wrong
-
-
 async def run_docker_command(*args) -> tuple[bool, str, str]:
     """Run a command inside a docker container"""
     logger.debug("Running docker command:")
@@ -160,6 +206,23 @@ async def run_docker_command(*args) -> tuple[bool, str, str]:
         logger.debug(f"Command {args[0]} failed: {stderr.decode()}")
         success = False
     return success, stdout.decode().strip(), stderr.decode().strip()
+
+
+async def get_container_host_port(
+    container_name: str, container_port: int = MONITOR_CONTAINER_PORT
+) -> int | None:
+    """Returns the host port docker assigned to a published container port,
+    or None if it could not be determined."""
+    success, stdout, _ = await run_docker_command(
+        "docker", "port", container_name, f"{container_port}/tcp"
+    )
+    if not success or not stdout:
+        return None
+    # One line per address family, e.g. '127.0.0.1:49153' or '[::]:49153'
+    try:
+        return int(stdout.splitlines()[0].rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
 
 
 async def wait_for_container_ready(container_name: str, timeout: float = 30):
@@ -203,7 +266,10 @@ def load_metadata(exp_dir: Path) -> dict:
             "experiment_start_timestamp": datetime.now().isoformat(),
             "python_version": sys.version,
             "executable": sys.executable,
-            "agent_iteration": 0,
+            # Number of completed generations (evaluate, then create children)
+            "generation": 0,
+            # Agents that exist but still have to be evaluated
+            "pending_agents": [0],
             "git_commit": None,
             # NOTE: the current_benchmark_idx field will be updated later, and
             # is set to -1 for improvement tasks, and 0, 1, 2, ... otherwise.
@@ -230,6 +296,63 @@ def update_metadata(exp_dir: Path, **kwargs) -> None:
     metadata.update(kwargs)
     with open(exp_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
+
+
+def resolve_selection_seed(exp_dir: Path, seed: int | None = None) -> int:
+    """The seed for parent selection in this experiment.
+
+    An explicitly given seed wins. Otherwise the experiment keeps the seed it
+    already has, so that resuming it does not change its random choices; a
+    new experiment gets a random one. The seed in use is stored in the
+    experiment metadata.
+    """
+    stored = load_metadata(exp_dir).get("selection_seed")
+    if seed is None:
+        seed = stored if stored is not None else random.SystemRandom().randrange(2**32)
+    elif stored is not None and stored != seed:
+        logger.warning(f"Selection seed changed from {stored} to {seed}")
+    if seed != stored:
+        update_metadata(exp_dir, selection_seed=seed)
+    return seed
+
+
+def resolve_evaluation_config(
+    exp_dir: Path,
+    seed: int,
+    repeats: int | None = None,
+    holdout_fraction: float | None = None,
+    stage1_size: int | None = None,
+    promote_threshold: float | None = None,
+) -> EvaluationConfig:
+    """How agents are evaluated in this experiment.
+
+    Settings not given keep the value stored with the experiment. The holdout
+    split is fixed once agents have been evaluated: changing it would show
+    held-out problems to the agents, and make results incomparable.
+
+    Raises:
+        ValueError: for invalid settings, or an attempt to change the split
+    """
+    stored = load_metadata(exp_dir).get("evaluation")
+    current = EvaluationConfig(**stored) if stored else EvaluationConfig(split_seed=seed)
+    given = {
+        "repeats": repeats,
+        "holdout_fraction": holdout_fraction,
+        "stage1_size": stage1_size,
+        "promote_threshold": promote_threshold,
+    }
+    config = EvaluationConfig(
+        **{**current.to_dict(), **{k: v for k, v in given.items() if v is not None}}
+    )
+    has_results = any(exp_dir.glob("agent_*/benchmarks"))
+    if has_results and config.holdout_fraction != current.holdout_fraction:
+        raise ValueError(
+            f"The holdout fraction of this experiment is {current.holdout_fraction} and "
+            "cannot be changed now that agents have been evaluated"
+        )
+    if config.to_dict() != stored:
+        update_metadata(exp_dir, evaluation=config.to_dict())
+    return config
 
 
 async def update_benchmark_progress(
@@ -346,11 +469,23 @@ Keep your analysis concise (no more than 1-2 paragraphs max) but thorough.
 class Job:
     """Represents a benchmark problem to be processed"""
 
-    def __init__(self, benchmark_name: str, problem: Problem, benchmark: BaseBenchmark):
+    def __init__(
+        self,
+        benchmark_name: str,
+        problem: Problem,
+        benchmark: BaseBenchmark,
+        repeat: int = 0,
+        total: int | None = None,
+    ):
         self.benchmark_name = benchmark_name
         self.problem = problem
         self.benchmark = benchmark
-        self.id = f"{benchmark_name}:{problem.problem_id}"
+        # Which run of the problem this is, and the id its result is stored under
+        self.repeat = repeat
+        self.result_id = result_id(problem.problem_id, repeat)
+        # Number of jobs of this benchmark in the current run
+        self.total = total if total is not None else len(benchmark.problems)
+        self.id = f"{benchmark_name}:{self.result_id}"
 
     def __str__(self):
         return self.id
@@ -362,15 +497,23 @@ async def process_job(
     agent_dir: Path,
     job: Job,
     worker_id: int,
+    image: str = SANDBOX_IMAGE,
+    results_exp_dir: Path | None = None,
 ) -> bool:
-    """Process a single benchmark problem job"""
+    """Process a single benchmark problem job
+
+    The results go to the agent's directory in `results_exp_dir`, which
+    mirrors the layout of the experiment directory (and defaults to it).
+    """
     TIMEOUT_SECONDS = 10 * 60  # 10 minutes timeout
     COST_THRESHOLD_USD = 3.00  # 3 USD cost limit per problem
 
     benchmark = job.benchmark
     problem = job.problem
 
-    benchmark_dir = agent_dir / "benchmarks" / benchmark.name
+    results_exp_dir = results_exp_dir or exp_dir
+    results_agent_dir = results_exp_dir / agent_dir.name
+    benchmark_dir = results_agent_dir / "benchmarks" / benchmark.name
     benchmark_dir.mkdir(parents=True, exist_ok=True)
 
     benchmark_lock = benchmark_locks[job.benchmark_name]
@@ -378,22 +521,22 @@ async def process_job(
 
     # Check if the problem is already completed
     async with benchmark_lock:
-        if problem.problem_id in results_tracker.results:
-            if results_tracker.results[problem.problem_id].is_complete():
-                logger.info(f"Problem {problem.problem_id} already completed, skipping")
+        if job.result_id in results_tracker.results:
+            if results_tracker.results[job.result_id].is_complete():
+                logger.info(f"Problem {job.result_id} already completed, skipping")
                 return True
             else:
-                logger.info(f"Re-doing incomplete problem {problem.problem_id}")
+                logger.info(f"Re-doing incomplete problem {job.result_id}")
         else:
-            results_tracker.start_problem(problem.problem_id)
+            results_tracker.start_problem(job.result_id, repeat=job.repeat)
 
-    logger.info(f"Starting {problem.problem_id} (worker {worker_id})")
+    logger.info(f"Starting {job.result_id} (worker {worker_id})")
 
-    logdir = agent_dir / "benchmarks" / benchmark.name / "traces" / problem.problem_id
+    logdir = benchmark_dir / "traces" / job.result_id
 
     # Create problem data directory
-    dirname = re.sub(r"[^a-zA-Z0-9_]", "", f"{benchmark.name}_{problem.problem_id}")
-    problem_data_dir = exp_dir / "problem_data" / dirname
+    dirname = re.sub(r"[^a-zA-Z0-9_]", "", f"{benchmark.name}_{job.result_id}")
+    problem_data_dir = results_exp_dir / "problem_data" / dirname
     if problem_data_dir.exists():
         shutil.rmtree(problem_data_dir)
     problem_data_dir.mkdir(parents=True)
@@ -403,7 +546,7 @@ async def process_job(
 
     # Create unique container name
     local_id = f"agent_{uuid4().hex[:8]}"
-    container_name = f"sica_{benchmark.name}_{problem.problem_id}_{local_id}"
+    container_name = f"sica_{benchmark.name}_{job.result_id}_{local_id}"
     container_name = re.sub(f"[^a-zA-Z0-9_]", "", container_name)
 
     try:
@@ -419,26 +562,36 @@ async def process_job(
             "--name",
             container_name,
         ]
-        container_cmd += ["-p", f"808{worker_id}:8080"]
+        container_cmd += ["-p", MONITOR_PORT_MAPPING]
         # Mount the experiment directory (results/run_{i})
         container_cmd += [
             "-v",
             f"{exp_dir.absolute()}:/home/agent/{exp_dir}:rw",
         ]
+        if results_exp_dir != exp_dir:
+            # Results are kept outside of the experiment directory
+            container_cmd += [
+                "-v",
+                f"{results_exp_dir.absolute()}:/home/agent/{results_exp_dir}:rw",
+            ]
         # Mount the problem data directory to the workdir
         container_cmd += [
             "-v",
             f"{problem_data_dir.absolute()}:/home/agent/workdir:rw",
         ]
-        container_cmd += ["sica_sandbox", "tail", "-f", "/dev/null"]
+        container_cmd += [image, "tail", "-f", "/dev/null"]
         success, _, stderr = await run_docker_command(*container_cmd)
         if not success:
             logger.error(
-                f"Failed to start container for {problem.problem_id}: {stderr}"
+                f"Failed to start container for {job.result_id}: {stderr}"
             )
             return False
 
         await wait_for_container_ready(container_name)
+        monitor_port = await get_container_host_port(container_name)
+        logger.info(
+            f"{job.result_id} (worker {worker_id}) monitor: http://localhost:{monitor_port}"
+        )
 
         try:
             # Setup the problem environment
@@ -485,7 +638,7 @@ async def process_job(
             except asyncio.TimeoutError:
                 # Timeout exceeded the grace period
                 logger.warning(
-                    f"Problem {problem.problem_id} timed out after {TIMEOUT_SECONDS} seconds"
+                    f"Problem {job.result_id} timed out after {TIMEOUT_SECONDS} seconds"
                 )
                 timed_out = True
                 success = False
@@ -503,7 +656,7 @@ async def process_job(
                     trace_path.write_text(timeout_msg)
 
             if not success:
-                logger.error(f"Problem {problem.problem_id} failed: {stderr}")
+                logger.error(f"Problem {job.result_id} failed: {stderr}")
                 return False
 
             if not timed_out:
@@ -518,11 +671,11 @@ async def process_job(
                 if float(time) >= TIMEOUT_SECONDS - 0.5:
                     timed_out = True
                     logger.info(
-                        f"Execution of {problem.problem_id} gracefully timed out after {TIMEOUT_SECONDS} seconds"
+                        f"Execution of {job.result_id} gracefully timed out after {TIMEOUT_SECONDS} seconds"
                     )
 
                 logger.info(
-                    f"{problem.problem_id} | tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
+                    f"{job.result_id} | tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
                 )
             else:
                 # Use placeholder values for timeout cases that exceed grace period
@@ -541,7 +694,7 @@ async def process_job(
 
             async with benchmark_lock:
                 results_tracker.update_problem(
-                    problem.problem_id,
+                    job.result_id,
                     tokens_used=int(tokens),
                     num_cached_tokens=int(cached),
                     cost_estimate=float(cost),
@@ -585,13 +738,13 @@ async def process_job(
 
             # Update the benchmark progress in metadata
             await update_benchmark_progress(
-                exp_dir, benchmark.name, problem.problem_id, len(benchmark.problems)
+                results_exp_dir, benchmark.name, job.result_id, job.total
             )
 
             return True
 
         except Exception as e:
-            logger.error(f"Error processing problem {problem.problem_id}: {e}")
+            logger.error(f"Error processing problem {job.result_id}: {e}")
             return False
     finally:
         # Cleanup running docker container
@@ -599,7 +752,7 @@ async def process_job(
 
         # Cleanup problem data directory
         shutil.rmtree(problem_data_dir)
-        logger.info(f"Completed {problem.problem_id}")
+        logger.info(f"Completed {job.result_id}")
 
 
 async def generate_benchmark_statistics(agent_dir: Path, benchmark_name: str) -> None:
@@ -608,14 +761,13 @@ async def generate_benchmark_statistics(agent_dir: Path, benchmark_name: str) ->
     results_tracker = BenchmarkTracker(benchmark_dir / "results.jsonl")
 
     # Aggregate scores and metrics across all problems to calculate overall metrics
-    scores = []
+    scores_by_problem: dict[str, list[float]] = {}
     tokens, cached, cost, time = 0, 0, 0, 0
     for result in results_tracker.results.values():
-        if result.score is not None:
-            scores.append(result.score)
-        else:
-            # Default invalid score to 0
-            scores.append(0)
+        # Default invalid score to 0
+        score = result.score if result.score is not None else 0
+        problem_id = base_problem_id(result.problem_id, result.repeat)
+        scores_by_problem.setdefault(problem_id, []).append(score)
         if result.tokens_used:
             tokens += result.tokens_used
         if result.num_cached_tokens:
@@ -625,6 +777,8 @@ async def generate_benchmark_statistics(agent_dir: Path, benchmark_name: str) ->
         if result.wall_time:
             time += result.wall_time
 
+    # Each problem counts once, however often it was run
+    scores = [sum(runs) / len(runs) for runs in scores_by_problem.values()]
     avg_score = sum(scores) / len(scores) if len(scores) > 0 else 0
     aggregates = dict(
         avg_score=avg_score,
@@ -647,8 +801,22 @@ async def run_benchmarks_with_job_queue(
     agent_dir: Path,
     benchmarks: list[Type[BaseBenchmark]],
     max_workers: int = 6,
+    image: str = SANDBOX_IMAGE,
+    results_exp_dir: Path | None = None,
+    select_problems=None,
+    repeats: int = 1,
 ) -> None:
-    """Run multiple benchmarks concurrently using a job queue approach"""
+    """Run multiple benchmarks concurrently using a job queue approach
+
+    Args:
+        results_exp_dir: Where results go (see process_job)
+        select_problems: Given a benchmark, returns the problems of it to run
+            (default: all of them)
+        repeats: Number of times to run each problem
+    """
+    results_exp_dir = results_exp_dir or exp_dir
+    results_agent_dir = results_exp_dir / agent_dir.name
+    results_exp_dir.mkdir(parents=True, exist_ok=True)
 
     # Create worker ID queue (used for port assignment)
     id_queue = asyncio.Queue()
@@ -659,7 +827,7 @@ async def run_benchmarks_with_job_queue(
     job_queue = asyncio.Queue()
 
     # Load benchmark progress from metadata
-    metadata = load_metadata(exp_dir)
+    metadata = load_metadata(results_exp_dir)
     benchmark_progress = metadata.get("benchmark_progress", {})
 
     # Initialize benchmarks and enqueue jobs
@@ -670,7 +838,7 @@ async def run_benchmarks_with_job_queue(
         # benchmark = benchmark_cls(seed=1, subset_size=None)  # For full benchmarks
         logger.info(f"Initializing benchmark: {benchmark.name}")
 
-        benchmark_dir = agent_dir / "benchmarks" / benchmark.name
+        benchmark_dir = results_agent_dir / "benchmarks" / benchmark.name
         benchmark_dir.mkdir(parents=True, exist_ok=True)
 
         # Create a global results tracker and lock for this benchmark
@@ -685,12 +853,15 @@ async def run_benchmarks_with_job_queue(
         )
 
         # Add problems to the queue
+        problems = select_problems(benchmark) if select_problems else benchmark.problems
+        total = len(problems) * repeats
         problems_to_process = 0
-        for problem in benchmark.problems:
-            if problem.problem_id not in completed_problems:
-                job = Job(benchmark.name, problem, benchmark)
-                await job_queue.put(job)
-                problems_to_process += 1
+        for repeat in range(repeats):
+            for problem in problems:
+                job = Job(benchmark.name, problem, benchmark, repeat, total)
+                if job.result_id not in completed_problems:
+                    await job_queue.put(job)
+                    problems_to_process += 1
 
         logger.info(
             f"Added {problems_to_process} problems from {benchmark.name} to queue"
@@ -702,7 +873,7 @@ async def run_benchmarks_with_job_queue(
         logger.info("No problems to process, all benchmarks are complete")
         # Generate final perf reports for each benchmark
         for benchmark_name, benchmark in benchmarks_dict.items():
-            await generate_benchmark_statistics(agent_dir, benchmark_name)
+            await generate_benchmark_statistics(results_agent_dir, benchmark_name)
         return
 
     async def worker():
@@ -718,7 +889,9 @@ async def run_benchmarks_with_job_queue(
                 try:
                     # Process the job
                     logger.info(f"Worker {worker_id} processing job {job}")
-                    await process_job(exp_dir, agent_dir, job, worker_id)
+                    await process_job(
+                        exp_dir, agent_dir, job, worker_id, image, results_exp_dir
+                    )
                 except Exception as e:
                     logger.error(f"Error in worker {worker_id} processing {job}: {e}")
                 finally:
@@ -745,152 +918,212 @@ async def run_benchmarks_with_job_queue(
 
     # Generate final perf reports for each benchmark
     for benchmark_name, benchmark in benchmarks_dict.items():
-        await generate_benchmark_statistics(agent_dir, benchmark_name)
+        await generate_benchmark_statistics(results_agent_dir, benchmark_name)
 
 
-async def run_meta_agent_benchmark(
-    exp_id: int,
-    iteration: int,
-    exp_dir: Path,
-    current_dir: Path,
-    next_dir: Path,
-    self_referential: bool = True,
-) -> None:
-    """Create the next agent version based on the current agent's results
+def agent_image_tag(exp_id: int, agent_id: int) -> str:
+    return f"{SANDBOX_IMAGE}:run{exp_id}_agent{agent_id}"
+
+
+async def resolve_agent_image(exp_id: int, agent_id: int) -> str:
+    """The image to run an agent in: its own if one was built, else the base
+    image (the initial agent, and agents from before per-agent images)."""
+    tag = agent_image_tag(exp_id, agent_id)
+    exists, _, _ = await run_docker_command("docker", "image", "inspect", tag)
+    return tag if exists else SANDBOX_IMAGE
+
+
+async def build_agent_image(tag: str, agent_code_dir: Path) -> tuple[bool, str]:
+    """Build the sandbox image for an agent, installing the requirements.txt
+    of that agent's code. Returns (success, stderr)."""
+    target_arch = "x86_64"  # Default architecture
+    # Detect if the script is running on a Mac with Apple Silicon
+    if platform.system() == "Darwin" and platform.processor() == "arm":
+        target_arch = "aarch64"
+    build_cmd = ["docker", "buildx", "build"]
+    build_cmd += ["--build-context", f"base_agent={agent_code_dir.absolute()}"]
+    build_cmd += ["--build-arg", f"TARGET_ARCH={target_arch}"]
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "FIREWORKS_AI_API_KEY",
+        "GEMINI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "VERTEX_PROJECT_ID",
+    ):
+        build_cmd += ["--build-arg", f"{key}={os.environ.get(key)}"]
+    build_cmd += ["-f", "sandbox/Dockerfile", "-t", tag, "--load", "sandbox"]
+    success, _, stderr = await run_docker_command(*build_cmd)
+    return success, stderr
+
+
+def set_aside(exp_dir: Path, agent_dir: Path) -> None:
+    """Move the remains of an interrupted meta-improvement out of the way
+    (to `_interrupted/`), so that the agent can be created afresh."""
+    target_root = exp_dir / "_interrupted"
+    target_root.mkdir(exist_ok=True)
+    target = target_root / f"{agent_dir.name}_{uuid4().hex[:8]}"
+    logger.warning(f"Setting aside incomplete {agent_dir} as {target}")
+    shutil.move(str(agent_dir), str(target))
+
+
+async def run_meta_agent_benchmark(exp_id: int, exp_dir: Path, child: dict) -> None:
+    """Create a new agent version from an archived one
 
     We can conceptually think of this as a 'meta agent improvement' benchmark.
+
+    Args:
+        exp_id: The experiment id
+        exp_dir: The experiment directory (results/run_{exp_id})
+        child: The planned agent (see plan_generation): its `id`, the
+            `parent_id` whose code it starts from, the `meta_agent_id` that
+            makes the changes (using `meta_model`, if given), and the
+            `selection` record of the parent choice
     """
-    current_agent_code_dir = current_dir / "agent_code"
-    next_agent_code_dir = next_dir / "agent_code"
-    logger.info("Creating new agent")
-    logger.info(f"current: {current_agent_code_dir}")
-    logger.info(f"next: {next_agent_code_dir}")
+    child_id: int = child["id"]
+    parent_id: int = child["parent_id"]
+    meta_agent_id: int = child["meta_agent_id"]
+    meta_model: str | None = child.get("meta_model")
+    child_dir = exp_dir / f"agent_{child_id}"
+    child_code_dir = child_dir / "agent_code"
+    parent_code_dir = exp_dir / f"agent_{parent_id}" / "agent_code"
+    logger.info(
+        f"Creating agent {child_id} from agent {parent_id} (meta agent: {meta_agent_id})"
+    )
 
-    # 1. Select the base agent to use for improvement
-    aa = ArchiveAnalyzer(f"results/run_{exp_id}")
-    base_iter = select_base_agent(aa, iteration, score_type="mean_score")
-    base_agent_dir = f"results/run_{exp_id}/agent_{base_iter}/agent_code"
-    logger.info(f"Selected agent {base_iter} as base for improvement")
+    if child_dir.exists():
+        existing = read_lineage(child_dir) or {}
+        if existing.get("status") in (STATUS_OK, STATUS_FAILED):
+            raise ValueError(f"Agent {child_id} has already been created")
+        set_aside(exp_dir, child_dir)
+    child_dir.mkdir(parents=True)
 
-    # 2. Copy the selected agent's code as starting point
-    base_code_dir = Path(base_agent_dir)
-    shutil.copytree(base_code_dir, next_agent_code_dir)
-
-    try:
-        best_iter = aa.get_best_agent_iteration()
-    except Exception:
-        best_iter = 0
-
-    # Old directory copying strategy (left in for reference)
-    # best_agent_dir = f"results/run_{exp_id}/agent_{best_iter}/agent_code"
-    # print(f"Detected best code dir as: {best_agent_dir}")
-    # base_strategy: Literal["best", "latest"] = "best"
-    # if base_strategy == "best":
-    #     base_code_dir = Path(best_agent_dir)
-    # else:
-    #     # Use the current agent's code directory for improvement
-    #     base_code_dir = current_agent_code_dir
-    #     print(f"Using current agent code dir as: {current_agent_code_dir}")
-    # print(f"Next agent code dir is: {next_agent_code_dir}")
-    # Copy the current agent code as a starting point
-    # shutil.copytree(base_code_dir, next_agent_code_dir)
-
-    # 3. Always copy the change log from the current agent to maintain history
-    try:
-        shutil.copy(
-            current_agent_code_dir / "agent_change_log.md",
-            next_agent_code_dir / "agent_change_log.md",
-        )
-    except shutil.SameFileError:
-        pass
-
-    # Setup meta-improvement logs directory
-    current_meta_log_dir = current_dir / "meta_improvement_logs"
-    container_meta_log_path = f"/home/agent/meta_improvement_logs_{iteration}"
-    current_meta_log_dir.mkdir(parents=True, exist_ok=True)
-
-    # if self_referential:
-    #     agent_module = str(best_agent_dir).replace("/", ".")
-    #     # Use current (latest) agent as meta agent
-    #     # agent_module = str(current_agent_code_dir).replace("/", ".")
-    # else:
-    #     # NOTE: this could be a specialised meta-improvement agent
-    #     # agent_module = "base_agent.agent_code"
-    #     agent_module = "meta_agent"
+    # Record where the new agent comes from. It stays 'pending' until the meta
+    # agent has run, and is marked 'failed' if it does not complete.
+    write_lineage(
+        child_dir,
+        id=child_id,
+        parent_id=parent_id,
+        meta_agent_id=meta_agent_id,
+        meta_model=meta_model,
+        generation=child_generation(exp_dir, parent_id),
+        selection=child.get("selection"),
+        status=STATUS_PENDING,
+    )
+    status = STATUS_FAILED
+    failure_reason: str | None = "Meta-improvement did not complete"
+    interrupted = False
 
     # Create a unique container name
     local_id = f"agent_{uuid4().hex[:8]}"
-    container_name = f"sica_run_{exp_id}_agent_{iteration}_improvement_{local_id}"
+    container_name = f"sica_run_{exp_id}_agent_{child_id}_improvement_{local_id}"
     container_name = re.sub(f"[^a-zA-Z0-9_]", "", container_name)
 
     try:
-        # Start the container
+        # 1. Copy the parent's code as the starting point. Its change log
+        # comes along, and describes exactly the changes present in this code.
+        shutil.copytree(parent_code_dir, child_code_dir)
+
+        # 2. What was tried on other branches goes in a generated section
+        update_change_log(
+            child_code_dir / "agent_change_log.md",
+            render_other_branches(ArchiveAnalyzer(exp_dir), parent_id),
+        )
+
+        # Setup meta-improvement logs directory
+        meta_log_dir = child_dir / "meta_improvement_logs"
+        container_meta_log_path = f"/home/agent/meta_improvement_logs_{child_id}"
+        meta_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # 3. Start the container, from the image of the agent that will run
+        image = await resolve_agent_image(exp_id, meta_agent_id)
         container_cmd = ["docker", "run", "--rm", "-d", "--name", container_name]
-        # Map port local:remote for monitoring server
-        container_cmd += ["-p", "8080:8080"]
+        # Publish the monitoring server on a free host port
+        container_cmd += ["-p", MONITOR_PORT_MAPPING]
         # Mount the full agent archive as read-only
         container_cmd += ["-v", f"{exp_dir.absolute()}:/home/agent/archive:ro"]
         # Mount the new agent directory as the workdir
-        container_cmd += [
-            "-v",
-            f"{next_agent_code_dir.absolute()}:/home/agent/workdir:rw",
-        ]
-        # Mount the meta agent directory
-        # container_cmd += [
-        #     "-v",
-        #     f"{Path('.').absolute()}/meta_agent:/home/agent/meta_agent:ro",
-        # ]
-        # Mount the env file for secrets
-        # container_cmd += ["-v", f"{Path('.env').absolute()}:/home/agent/.env:ro"]
+        container_cmd += ["-v", f"{child_code_dir.absolute()}:/home/agent/workdir:rw"]
         # Mount meta agent log directory
-        container_cmd += [
-            "-v",
-            f"{current_meta_log_dir .absolute()}:{container_meta_log_path}:rw",
-        ]
-        container_cmd += ["sica_sandbox", "tail", "-f", "/dev/null"]
+        container_cmd += ["-v", f"{meta_log_dir.absolute()}:{container_meta_log_path}:rw"]
+        container_cmd += [image, "tail", "-f", "/dev/null"]
         success, _, stderr = await run_docker_command(*container_cmd)
         if not success:
             logger.error(f"Could not start container: {stderr}")
+            failure_reason = f"Could not start container: {stderr[-2000:]}"
             return
 
         await wait_for_container_ready(container_name)
+        monitor_port = await get_container_host_port(container_name)
+        logger.info(
+            f"Meta-improvement monitor (agent {child_id}): http://localhost:{monitor_port}"
+        )
 
-        # Execute the (meta) agent command and get stdout
-        # archive.agent_{i}.agent_code
-        agent_module = f"archive.agent_{best_iter}.agent_code"
-        # agent_module = f"meta_agent"
+        # 4. Execute the (meta) agent command and get stdout
+        agent_module = f"archive.agent_{meta_agent_id}.agent_code"
         agent_cmd = ["python", "-m", agent_module, "improve"]
         agent_cmd += ["--workdir", "/home/agent/workdir"]
-        # agent_cmd += ["--logdir", f"/home/agent/archive/agent_{iteration}/meta_improvement"]
         agent_cmd += ["--logdir", container_meta_log_path]
-        agent_cmd += ["--best-iter", str(best_iter)]
-        agent_cmd += ["--current-iter", str(iteration)]
+        # The agent whose code is in the workdir, and the agent being created
+        agent_cmd += ["--best-iter", str(parent_id)]
+        agent_cmd += ["--current-iter", str(child_id)]
+        exec_cmd = ["docker", "exec"]
+        if meta_model:
+            # Read by the agent's settings (AGENT_ prefix), for this run only
+            exec_cmd += ["-e", f"AGENT_MODEL={meta_model}"]
         success, stdout, stderr = await run_docker_command(
-            "docker", "exec", container_name, *agent_cmd
+            *exec_cmd, container_name, *agent_cmd
         )
 
         if not success:
-            logger.error(f"Meta agent failed at iteration {iteration}: {stderr}")
+            logger.error(f"Meta agent failed creating agent {child_id}: {stderr}")
             logger.error(stdout)
+            failure_reason = f"Meta agent exited with an error: {stderr[-2000:]}"
             return
+
+        # 5. Build the new agent's image, with its (possibly changed)
+        # requirements.txt. An agent whose image does not build cannot run.
+        built, build_stderr = await build_agent_image(
+            agent_image_tag(exp_id, child_id), child_code_dir
+        )
+        if not built:
+            logger.error(f"Image build failed for agent {child_id}: {build_stderr}")
+            failure_reason = f"Image build failed: {build_stderr[-2000:]}"
+            return
+
+        # The agent is usable; anything that goes wrong from here on (usage
+        # statistics, summaries) does not invalidate it.
+        status, failure_reason = STATUS_OK, None
 
         tokens, cached, cost, time = stdout.splitlines()[-1].split("|")
         percent_cached = int(cached) / int(tokens) * 100 if int(tokens) > 0 else 0
+        # What it took to create this agent, for cost accounting
+        write_lineage(
+            child_dir,
+            usage={
+                "tokens": int(tokens),
+                "cached_tokens": int(cached),
+                "cost": float(cost),
+                "time": float(time),
+            },
+        )
         logger.info(
-            f"meta-improvement || tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
+            f"meta-improvement (agent {child_id}) || tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
         )
 
-        # 4. Generate and save a summary for the meta-improvement logs
-        trace_path = current_meta_log_dir / "execution_tree.txt"
+        # 6. Generate and save a summary for the meta-improvement logs
+        trace_path = meta_log_dir / "execution_tree.txt"
         if trace_path.exists():
             trace = trace_path.read_text()
         else:
             trace = "No trace was available"
 
         # Define a simple problem statement and answer for context
-        problem_statement = f"Improve the agent from iteration {base_iter} to create iteration {iteration + 1}"
-        llm_answer = "Agent code updated" if success else "Improvement failed"
-        score = 1.0 if success else 0.0  # Binary success/failure
+        problem_statement = (
+            f"Improve the agent from iteration {parent_id} to create iteration {child_id}"
+        )
+        llm_answer = "Agent code updated"
+        score = 1.0  # Binary success/failure
 
         # Additional context for the summary
         meta_context = (
@@ -910,68 +1143,364 @@ async def run_meta_agent_benchmark(
             answer_discussion=meta_context,
         )
 
-        summary_path = current_meta_log_dir / "summary.txt"
+        summary_path = meta_log_dir / "summary.txt"
         summary_path.write_text(summary)
         logger.info(f"Meta-improvement summary saved to {summary_path}")
 
-        # Generate the new agent's documentation
-        # docs_cmd = ["python", "/home/agent/workdir/utils/documentation.py"]
-        # docs_cmd += ["/home/agent/workdir", ">"]
-        # docs_cmd += ["/home/agent/workdir/DOCUMENTATION.md"]
-        # success, stdout, stderr = await run_docker_command(
-        #     "docker", "exec", container_name, *docs_cmd
-        # )
-        # if not success:
-        #     logger.warning(f"Failed to re-generate docs {iteration}: {stderr}")
+    except Exception as e:
+        if status != STATUS_OK:
+            failure_reason = f"{type(e).__name__}: {e}"
+        raise
 
-        # Copy the meta-improvement logs into the archive
-        # NOTE: this is already done by mounting the appropriate dir
-        # meta_log_cp_cmd = ["docker", "cp", f"{container_name}:{container_meta_log_path}"]
-        # meta_log_cp_cmd += [current_dir / "meta_improvement_logs"]
-        # await run_docker_command(*meta_log_cp_cmd)
-
-        # At this point, re-build the sica_sandbox image in case the
-        # requirements.txt changed; ready for the next iteration
-
-        target_arch = "x86_64"  # Default architecture
-        # Detect if the script is running on a Mac with Apple Silicon
-        if platform.system() == "Darwin" and platform.processor() == "arm":
-            target_arch = "aarch64"
-        build_cmd = ["docker", "buildx", "build"]
-        build_cmd += ["--build-context", "base_agent=./base_agent"]
-        build_cmd += ["--build-arg", f"TARGET_ARCH={target_arch}"]
-        build_cmd += [
-            "--build-arg",
-            f"ANTHROPIC_API_KEY={os.environ.get('ANTHROPIC_API_KEY')}",
-        ]
-        build_cmd += [
-            "--build-arg",
-            f"OPENAI_API_KEY={os.environ.get('OPENAI_API_KEY')}",
-        ]
-        build_cmd += [
-            "--build-arg",
-            f"FIREWORKS_AI_API_KEY={os.environ.get('FIREWORKS_AI_API_KEY')}",
-        ]
-        build_cmd += [
-            "--build-arg",
-            f"GEMINI_API_KEY={os.environ.get('GEMINI_API_KEY')}",
-        ]
-        build_cmd += [
-            "--build-arg",
-            f"DEEPSEEK_API_KEY={os.environ.get('DEEPSEEK_API_KEY')}",
-        ]
-        build_cmd += [
-            "--build-arg",
-            f"VERTEX_PROJECT_ID={os.environ.get('VERTEX_PROJECT_ID')}",
-        ]
-        build_cmd += ["-f", "sandbox/Dockerfile", "-t", "sica_sandbox", "sandbox"]
-
-        await run_docker_command(*build_cmd)
+    except BaseException:
+        # The runner itself is being stopped (Ctrl-C, cancellation)
+        interrupted = True
+        raise
 
     finally:
 
         # Cleanup running docker container
         await run_docker_command("docker", "rm", "-f", container_name)
+
+        if status == STATUS_OK:
+            write_lineage(child_dir, status=status)
+        elif interrupted:
+            # Left 'pending', so that it is created afresh on resumption
+            logger.warning(f"Creation of agent {child_id} was interrupted")
+        else:
+            logger.error(f"Marking agent {child_id} as failed: {failure_reason}")
+            write_lineage(child_dir, status=status, failure_reason=failure_reason)
+
+
+# Generations -----------------------------------------------------------------
+
+
+def load_search_state(exp_dir: Path) -> dict:
+    """The experiment metadata, with the search state fields present.
+
+    Experiments from before generations only stored `agent_iteration`: the
+    agent that was being evaluated, all agents up to it being complete. Those
+    agents may have no lineage record, and get one here (of unknown ancestry).
+    """
+    metadata = load_metadata(exp_dir)
+    if "pending_agents" not in metadata:
+        current = metadata.get("agent_iteration", 0)
+        for agent_id in get_agent_ids(exp_dir):
+            agent_dir = exp_dir / f"agent_{agent_id}"
+            if agent_id <= current and read_lineage(agent_dir) is None:
+                write_lineage(agent_dir, id=agent_id, status=STATUS_OK)
+        update_metadata(exp_dir, generation=current, pending_agents=[current])
+        metadata = load_metadata(exp_dir)
+    return metadata
+
+
+def get_agent_ids(exp_dir: Path) -> list[int]:
+    """The ids of all agent directories in an experiment"""
+    ids = []
+    for agent_dir in exp_dir.glob("agent_*"):
+        try:
+            ids.append(int(agent_dir.name.split("_")[1]))
+        except (IndexError, ValueError):
+            continue
+    return sorted(ids)
+
+
+def set_aside_incomplete_agents(exp_dir: Path) -> None:
+    """Set aside agent directories left behind by an interrupted
+    meta-improvement step: those never recorded as finished."""
+    for agent_id in get_agent_ids(exp_dir):
+        agent_dir = exp_dir / f"agent_{agent_id}"
+        record = read_lineage(agent_dir) or {}
+        if record.get("status") not in (STATUS_OK, STATUS_FAILED):
+            set_aside(exp_dir, agent_dir)
+
+
+def check_meta_agent(exp_dir: Path, meta_agent: str | int) -> None:
+    """Raises ValueError if a fixed meta agent cannot do the job: it has to
+    exist, and to have been created successfully."""
+    if isinstance(meta_agent, str):
+        if meta_agent not in META_AGENT_CHOICES:
+            raise ValueError(f"Unknown meta agent {meta_agent!r}")
+        return
+    if meta_agent not in get_agent_ids(exp_dir):
+        raise ValueError(f"Meta agent {meta_agent} does not exist in {exp_dir}")
+    if meta_agent in get_failed_iterations(exp_dir):
+        raise ValueError(f"Meta agent {meta_agent} was not created successfully")
+
+
+def plan_generation(
+    exp_dir: Path,
+    generation: int,
+    n_children: int,
+    selection: str = DEFAULT_SELECTION_STRATEGY,
+    seed: int = 0,
+    meta_agent: str | int = "best",
+    meta_model: str | None = None,
+) -> list[dict]:
+    """Decide which agents to create in a generation, and from which parents.
+
+    `meta_agent` says which agent carries out each improvement: 'best' (the
+    best-scoring agent), 'parent' (the new agent's own parent), 'seed' (the
+    initial agent) or a fixed agent id. `meta_model` optionally overrides the
+    model that it uses.
+
+    The plan is made once per generation and stored, so that a resumed
+    experiment creates the same agents as an uninterrupted one.
+    """
+    # Agents whose own meta-improvement step failed are never built upon, nor
+    # used as the meta agent. Nor are agents that were dropped after the first
+    # evaluation stage: they were clearly worse than their parent, and their
+    # scores on a subset of the problems are not comparable with the others'.
+    failed = get_failed_iterations(exp_dir) | get_pruned_iterations(exp_dir)
+    analyzer = ArchiveAnalyzer(exp_dir)
+    agent_ids = get_agent_ids(exp_dir) or [0]
+
+    archive_view = ArchiveView.from_analyzer(
+        analyzer, max(agent_ids), score_type="mean_score", excluded=failed
+    )
+    selected = get_selector(selection).select(
+        archive_view, k=n_children, rng=selection_rng(seed, generation)
+    )
+
+    check_meta_agent(exp_dir, meta_agent)
+    try:
+        best_agent_id = analyzer.get_best_agent_iteration(exclude=failed)
+    except Exception:
+        best_agent_id = 0
+
+    def meta_agent_for(parent_id: int) -> int:
+        if meta_agent == "best":
+            return best_agent_id
+        if meta_agent == "parent":
+            return parent_id
+        if meta_agent == "seed":
+            return 0
+        return int(meta_agent)
+
+    weights = {str(i): w for i, w in selected.weights.items()}
+    next_id = max(agent_ids) + 1
+    return [
+        {
+            "id": next_id + index,
+            "parent_id": parent_id,
+            "meta_agent_id": meta_agent_for(parent_id),
+            "meta_model": meta_model,
+            # Enough to reproduce the choice of parent: it is
+            # select(k=n_children, rng=selection_rng(seed, generation)).parents[index]
+            "selection": {
+                "strategy": selection,
+                "seed": seed,
+                "generation": generation,
+                "n_children": n_children,
+                "index": index,
+                "weights": weights,
+            },
+        }
+        for index, parent_id in enumerate(selected.parents)
+    ]
+
+
+async def evaluate_agent(
+    exp_id: int,
+    exp_dir: Path,
+    agent_id: int,
+    workers: int,
+    config: EvaluationConfig,
+) -> None:
+    """Run the benchmarks for one agent.
+
+    With stages, the agent is first run on a few problems per benchmark, and
+    evaluated in full only if that does not show it to be clearly worse than
+    its parent. With a holdout fraction, the held-out problems are run last,
+    with their results kept outside of the experiment directory.
+    """
+    agent_dir = exp_dir / f"agent_{agent_id}"
+    benchmarks = list(benchmark_registry.values())
+    image = await resolve_agent_image(exp_id, agent_id)
+    seed = config.split_seed
+
+    def dev(benchmark: BaseBenchmark) -> list[Problem]:
+        return split_problems(
+            benchmark.problems, benchmark.name, config.holdout_fraction, seed
+        )[0]
+
+    def holdout(benchmark: BaseBenchmark) -> list[Problem]:
+        return split_problems(
+            benchmark.problems, benchmark.name, config.holdout_fraction, seed
+        )[1]
+
+    def stage1(benchmark: BaseBenchmark) -> list[Problem]:
+        return stage1_problems(dev(benchmark), benchmark.name, config.stage1_size, seed)
+
+    record = read_lineage(agent_dir) or {}
+    parent_id = record.get("parent_id")
+    evaluation = record.get("evaluation") or {}
+
+    # First stage, unless its outcome was already decided (when resuming)
+    if config.stage1_size > 0 and parent_id is not None and "promoted" not in evaluation:
+        logger.info(f"Running first-stage benchmarks for agent {agent_id}")
+        await run_benchmarks_with_job_queue(
+            exp_dir,
+            agent_dir,
+            benchmarks,
+            workers,
+            image=image,
+            select_problems=stage1,
+            repeats=config.repeats,
+        )
+        delta = ArchiveAnalyzer(exp_dir).paired_delta(agent_id, parent_id)
+        evaluation = {
+            "promoted": should_promote(delta, config.promote_threshold),
+            "promote_threshold": config.promote_threshold,
+            "stage1_delta": (
+                None
+                if delta is None
+                else {
+                    "mean": delta.mean,
+                    "ci_lower": delta.ci_lower,
+                    "ci_upper": delta.ci_upper,
+                    "n_problems": delta.n_problems,
+                }
+            ),
+        }
+        write_lineage(agent_dir, evaluation=evaluation)
+        logger.info(
+            f"Agent {agent_id} vs parent {parent_id} after the first stage: {delta}"
+        )
+
+    if evaluation.get("promoted") is False:
+        logger.warning(
+            f"Agent {agent_id} is clearly worse than its parent; not evaluating it in full"
+        )
+        return
+
+    logger.info(f"Running benchmarks for agent {agent_id}")
+    await run_benchmarks_with_job_queue(
+        exp_dir,
+        agent_dir,
+        benchmarks,
+        workers,
+        image=image,
+        select_problems=dev,
+        repeats=config.repeats,
+    )
+    if config.holdout_fraction > 0:
+        logger.info(f"Running held-out benchmarks for agent {agent_id}")
+        await run_benchmarks_with_job_queue(
+            exp_dir,
+            agent_dir,
+            benchmarks,
+            workers,
+            image=image,
+            results_exp_dir=holdout_dir(exp_dir),
+            select_problems=holdout,
+            repeats=config.repeats,
+        )
+
+
+async def evaluate_pending_agents(
+    exp_id: int,
+    exp_dir: Path,
+    workers: int,
+    config: EvaluationConfig = EvaluationConfig(),
+) -> None:
+    """Run the benchmarks for every agent that has not been evaluated yet"""
+    pending: list[int] = list(load_metadata(exp_dir).get("pending_agents", []))
+    while pending:
+        agent_id = pending[0]
+        if agent_id in get_failed_iterations(exp_dir):
+            # Its meta-improvement step failed, so the code is in an unknown
+            # state: don't spend benchmark budget on it.
+            logger.warning(f"Agent {agent_id} is marked as failed; skipping its benchmarks")
+        else:
+            await evaluate_agent(exp_id, exp_dir, agent_id, workers, config)
+        pending = pending[1:]
+        # Important: reset benchmark progress for the next agent
+        update_metadata(exp_dir, pending_agents=pending, benchmark_progress=dict())
+        if config.holdout_fraction > 0 and holdout_dir(exp_dir).exists():
+            update_metadata(holdout_dir(exp_dir), benchmark_progress=dict())
+
+
+async def run_search(
+    exp_id: int,
+    exp_dir: Path,
+    iterations: int,
+    workers: int,
+    n_children: int = 1,
+    selection: str = DEFAULT_SELECTION_STRATEGY,
+    seed: int = 0,
+    config: EvaluationConfig = EvaluationConfig(),
+    meta_agent: str | int = "best",
+    meta_model: str | None = None,
+) -> None:
+    """The self-improvement loop. In each generation: evaluate the agents that
+    have not been evaluated yet, then create `n_children` new agents."""
+    start_generation = load_search_state(exp_dir)["generation"]
+    logger.info(f"Starting from generation {start_generation}")
+
+    for generation in range(start_generation, iterations):
+        await evaluate_pending_agents(exp_id, exp_dir, workers, config)
+
+        # Plan the new agents, unless resuming a generation already planned
+        plan = load_metadata(exp_dir).get("planned_children")
+        if not plan:
+            set_aside_incomplete_agents(exp_dir)
+            plan = plan_generation(
+                exp_dir, generation, n_children, selection, seed, meta_agent, meta_model
+            )
+            update_metadata(exp_dir, planned_children=plan)
+
+        def is_created(child: dict) -> bool:
+            record = read_lineage(exp_dir / f"agent_{child['id']}") or {}
+            return record.get("status") in (STATUS_OK, STATUS_FAILED)
+
+        todo = [child for child in plan if not is_created(child)]
+        logger.info(
+            f"Generation {generation}: creating agents {[c['id'] for c in todo]} "
+            f"from parents {[c['parent_id'] for c in todo]}"
+        )
+        results = await asyncio.gather(
+            *(run_meta_agent_benchmark(exp_id, exp_dir, child) for child in todo),
+            return_exceptions=True,
+        )
+        errors = [r for r in results if isinstance(r, BaseException)]
+        for child, result in zip(todo, results):
+            if isinstance(result, BaseException):
+                logger.error(f"Creating agent {child['id']} raised {result!r}")
+        interruption = next((e for e in errors if not isinstance(e, Exception)), None)
+        if interruption is not None:
+            raise interruption
+        if errors and len(errors) == len(todo):
+            # Nothing worked: more likely a broken setup than bad agents
+            raise errors[0]
+
+        update_metadata(
+            exp_dir,
+            generation=generation + 1,
+            pending_agents=[child["id"] for child in plan],
+            planned_children=None,
+            benchmark_progress=dict(),
+        )
+        logger.info(f"Completed generation {generation}")
+
+
+def initialise_experiment(exp_dir: Path) -> None:
+    """Create a new experiment directory, with the base agent as agent_0"""
+    exp_dir.mkdir(parents=True)
+    load_metadata(exp_dir)  # Creates if doesn't exist
+
+    # Copy the initial agent
+    agent_0_dir = exp_dir / "agent_0"
+    agent_0_dir.mkdir()
+    shutil.copytree("base_agent", agent_0_dir / "agent_code")
+    write_lineage(
+        agent_0_dir,
+        id=0,
+        parent_id=None,
+        meta_agent_id=None,
+        generation=0,
+        status=STATUS_OK,
+    )
 
 
 async def main():
@@ -986,13 +1515,7 @@ async def main():
 
     # Setup experiment directory
     if not exp_dir.exists():
-        exp_dir.mkdir(parents=True)
-        load_metadata(exp_dir)  # Creates if doesn't exist
-
-        # Copy the initial agent
-        agent_0_dir = exp_dir / "agent_0"
-        agent_0_dir.mkdir()
-        shutil.copytree("base_agent", agent_0_dir / "agent_code")
+        initialise_experiment(exp_dir)
         logger.info(f"Initialized experiment {exp_id} in {exp_dir}")
 
     # Handle test mode
@@ -1011,40 +1534,55 @@ async def main():
 
         # Run the specified benchmark using the job queue approach
         await run_benchmarks_with_job_queue(
-            exp_dir, latest_agent, [benchmark_cls], args.workers
+            exp_dir,
+            latest_agent,
+            [benchmark_cls],
+            args.workers,
+            image=await resolve_agent_image(
+                exp_id, int(latest_agent.name.split("_")[1])
+            ),
         )
         return
 
-    # Load state for resumption
-    metadata = load_metadata(exp_dir)
-    start_iteration = metadata["agent_iteration"]
-    logger.info(f"Starting from iteration {start_iteration}")
+    if args.children < 1:
+        parser.error("--children must be at least 1")
 
-    # Full loop
-    for i in range(start_iteration, args.iterations):
-        current_agent_dir = exp_dir / f"agent_{i}"
-        next_agent_dir = exp_dir / f"agent_{i+1}"
-
-        # Run all benchmarks concurrently using job queue
-        logger.info(f"Running benchmarks for iteration {i}")
-        await run_benchmarks_with_job_queue(
-            exp_dir, current_agent_dir, list(benchmark_registry.values()), args.workers
+    selection_seed = resolve_selection_seed(exp_dir, args.seed)
+    logger.info(
+        f"Parent selection: {args.selection} (seed {selection_seed}), "
+        f"{args.children} new agent(s) per iteration"
+    )
+    try:
+        config = resolve_evaluation_config(
+            exp_dir,
+            selection_seed,
+            repeats=args.repeats,
+            holdout_fraction=args.holdout_fraction,
+            stage1_size=args.stage1_size,
+            promote_threshold=args.promote_threshold,
         )
-
-        # Improvement task
-        logger.info(f"Starting agent improvement for iteration {i}")
-        next_agent_dir.mkdir(exist_ok=False, parents=True)
-        await run_meta_agent_benchmark(
-            exp_id, i, exp_dir, current_agent_dir, next_agent_dir
-        )
-
-        # Update metadata for next iteration
-        update_metadata(exp_dir, agent_iteration=i + 1)
-        logger.info(f"Completed iteration {i}, moving to {i+1}")
-
-        # Important: reset benchmark progress for the new iteration
-        update_metadata(exp_dir, benchmark_progress=dict())
-        logger.info("Reset benchmark progress for next iteration")
+    except ValueError as e:
+        parser.error(str(e))
+    logger.info(f"Evaluation: {config}")
+    try:
+        check_meta_agent(exp_dir, args.meta_agent)
+    except ValueError as e:
+        parser.error(str(e))
+    logger.info(
+        f"Meta agent: {args.meta_agent}, model: {args.meta_model or 'its own default'}"
+    )
+    await run_search(
+        exp_id,
+        exp_dir,
+        args.iterations,
+        args.workers,
+        n_children=args.children,
+        selection=args.selection,
+        seed=selection_seed,
+        config=config,
+        meta_agent=args.meta_agent,
+        meta_model=args.meta_model,
+    )
 
 
 if __name__ == "__main__":

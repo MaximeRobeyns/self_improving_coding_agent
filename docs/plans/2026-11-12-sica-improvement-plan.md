@@ -157,7 +157,12 @@ class ParentSelector(Protocol):
 - `--config run.yaml` + CLI 오버라이드. 사용한 설정 전체를 `metadata.json`에 저장.
 - `benchmark_registry`는 전부 등록하고, 실행할 것만 설정의 이름 목록으로 고른다 (주석 해제 방식 제거).
 
-### 1-4. 결과 프로토콜과 상태 저장 (F10)
+### 1-4. 결과 프로토콜과 상태 저장 (F10) (구현 완료)
+
+구현 메모:
+- `usage.json`의 필드는 `lineage.json`의 `usage`와 같은 `{tokens, cached_tokens, cost, time}`로 맞췄다. 에이전트의 세 진입점(benchmark, improve, 일반 실행)이 모두 쓴다.
+- 일반 실행도 사용량을 남기므로, 검증 게이트의 수정 재시도 비용이 에이전트의 `usage`에 합산된다 (새 seed에서 나온 메타 에이전트부터).
+- 실패 사유는 `results.jsonl` 행의 `error`에 남는다. 점수는 비워 두므로 재개 시 다시 시도하는 기존 동작은 그대로다.
 
 - 에이전트가 `logdir/usage.json`(`{tokens, cached, cost, wall_time}`)을 쓰고 runner가 읽는다. 이전 세대 에이전트와의 호환을 위해 stdout 파싱은 fallback으로 남긴다.
 - `update_metadata`를 임시 파일 + `os.replace`로 원자적 쓰기.

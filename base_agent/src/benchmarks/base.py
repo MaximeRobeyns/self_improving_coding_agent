@@ -38,6 +38,8 @@ class ProblemResult:
     # Which run of the problem this is, when problems are run more than once.
     # The problem_id of runs after the first ends in '#<repeat>'.
     repeat: int = 0
+    # Why the last attempt at this problem produced no score, if it did not
+    error: str | None = None
 
     def is_complete(self) -> bool:
         # Considered complete if it has been scored

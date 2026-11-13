@@ -52,8 +52,19 @@ def test_monitor_port_mapping_lets_docker_pick_the_host_port():
 class FakeDocker:
     """Replaces run_docker_command; fails the sub-commands named in `fail`."""
 
-    def __init__(self, fail: set[str] = frozenset(), fail_commands: dict | None = None):
+    def __init__(
+        self,
+        fail: set[str] = frozenset(),
+        fail_commands: dict | None = None,
+        usage_report: dict | None = None,
+        usage_line: str = "1000|500|0.25|12.5",
+    ):
         self.fail = fail
+        # What agents write as usage.json in their log directory (None: they
+        # are agents from before usage reports), and print as their last line
+        self.usage_report = usage_report
+        self.usage_line = usage_line
+        self.mounts: dict[str, str] = {}  # container path -> host path
         # {text: n}: commands containing the text fail, the first n times
         # they are run (always, if n is None)
         self.fail_commands = dict(fail_commands or {})
@@ -64,6 +75,11 @@ class FakeDocker:
         subcommand = args[1]
         if subcommand in self.fail:
             return False, "", f"{subcommand} went wrong"
+        if subcommand == "run":
+            for position, arg in enumerate(args):
+                if arg == "-v":
+                    host, container = args[position + 1].split(":")[:2]
+                    self.mounts[container] = host
         text = " ".join(map(str, args))
         for marker, remaining in self.fail_commands.items():
             if marker in text and remaining != 0:
@@ -76,9 +92,20 @@ class FakeDocker:
             return True, '"running"', ""
         if subcommand == "port":
             return True, "127.0.0.1:49153", ""
-        if subcommand == "exec" and ("improve" in args or "benchmark" in args):
-            return True, "some agent output\n1000|500|0.25|12.5", ""
+        if subcommand == "exec" and "--logdir" in args:  # an agent run
+            if self.usage_report is not None:
+                logdir = self.host_path(args[args.index("--logdir") + 1])
+                logdir.mkdir(parents=True, exist_ok=True)
+                (logdir / "usage.json").write_text(json.dumps(self.usage_report))
+            return True, f"some agent output\n{self.usage_line}".rstrip("\n"), ""
         return True, "", ""
+
+    def host_path(self, container_path: str) -> Path:
+        """Where a path inside a container is on the host, going by the mounts"""
+        for container, host in sorted(self.mounts.items(), key=lambda m: -len(m[0])):
+            if container_path == container or container_path.startswith(container + "/"):
+                return Path(host + container_path[len(container):])
+        return Path(container_path)
 
     def calls_to(self, subcommand: str) -> list[tuple]:
         return [c for c in self.calls if c[1] == subcommand]
@@ -1466,3 +1493,151 @@ def test_no_credentials_in_the_image_definition():
             assert "TARGET_ARCH" in line
     # Each container that the Makefile starts is given the credentials
     assert makefile.count("docker run") == makefile.count("$(SANDBOX_SECRETS)") == 3
+
+
+# Usage reports ------------------------------------------------------------------
+
+REPORT = {"tokens": 4200, "cached_tokens": 100, "cost": 0.5, "time": 30.0}
+
+
+def use_docker(monkeypatch, **kwargs):
+    docker = FakeDocker(**kwargs)
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+    return docker
+
+
+def first_result(experiment):
+    return read_results(experiment / "agent_0")[0]
+
+
+def run_one_problem(experiment):
+    run_queue(experiment, select_problems=lambda b: b.problems[:1])
+    return first_result(experiment)
+
+
+def test_benchmark_usage_comes_from_the_agents_report(experiment, monkeypatch):
+    use_docker(monkeypatch, usage_report=REPORT)
+
+    result = run_one_problem(experiment)
+
+    assert (result["tokens_used"], result["num_cached_tokens"]) == (4200, 100)
+    assert (result["cost_estimate"], result["wall_time"]) == (0.5, 30.0)
+    assert result["score"] == 1.0
+
+
+def test_report_is_used_even_if_the_output_ends_in_something_else(experiment, monkeypatch):
+    use_docker(monkeypatch, usage_report=REPORT, usage_line="Traceback noise | not usage")
+    assert run_one_problem(experiment)["cost_estimate"] == 0.5
+
+
+def test_agents_without_a_report_are_read_from_their_output(experiment, monkeypatch):
+    use_docker(monkeypatch)  # prints '1000|500|0.25|12.5', writes no report
+    result = run_one_problem(experiment)
+    assert (result["tokens_used"], result["cost_estimate"]) == (1000, 0.25)
+
+
+def test_report_of_an_earlier_attempt_is_not_reused(experiment, monkeypatch):
+    logdir = experiment / "agent_0" / "benchmarks" / "fake" / "traces" / "p0"
+    logdir.mkdir(parents=True)
+    (logdir / "usage.json").write_text(json.dumps(REPORT))
+    use_docker(monkeypatch)  # this attempt writes no report
+
+    assert run_one_problem(experiment)["cost_estimate"] == 0.25
+
+
+def test_meta_improvement_usage_comes_from_the_report(experiment, monkeypatch):
+    use_docker(monkeypatch, usage_report=REPORT)
+
+    record = create(experiment)
+
+    assert record["usage"] == REPORT
+    assert (experiment / "agent_1" / "meta_improvement_logs" / "usage.json").exists()
+
+
+def test_cost_of_fixing_an_agent_is_added_to_its_usage(experiment, monkeypatch):
+    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    use_docker(monkeypatch, usage_report=REPORT, fail_commands={"&& pytest": 1})
+
+    record = create_with_gate(experiment, GateConfig(retries=1))
+
+    assert record["status"] == "ok"
+    # The improvement itself, plus one fix
+    assert record["usage"] == {"tokens": 8400, "cached_tokens": 200, "cost": 1.0, "time": 60.0}
+
+
+# Failures are recorded ------------------------------------------------------------
+
+
+def test_failed_run_keeps_its_reason_and_is_retried(experiment, monkeypatch):
+    use_docker(monkeypatch, fail_commands={" benchmark ": None})
+
+    result = run_one_problem(experiment)
+
+    assert result["score"] is None
+    assert "benchmark  went wrong" in result["error"]
+    assert "benchmark_progress" not in runner.load_metadata(experiment)
+
+    # Resuming the experiment attempts it again
+    use_docker(monkeypatch)
+    result = run_one_problem(experiment)
+    assert (result["score"], result["error"]) == (1.0, None)
+
+
+def test_container_start_failure_is_recorded(experiment, monkeypatch):
+    use_docker(monkeypatch, fail={"run"})
+    result = run_one_problem(experiment)
+    assert result["score"] is None
+    assert result["error"] == "Could not start container: run went wrong"
+
+
+def test_run_that_reports_no_usage_is_recorded_as_failed(experiment, monkeypatch):
+    use_docker(monkeypatch, usage_line="")
+    result = run_one_problem(experiment)
+    assert result["score"] is None
+    assert result["error"] == "ValueError: The agent did not report its usage"
+
+
+def test_error_while_scoring_is_recorded(experiment, monkeypatch):
+    use_docker(monkeypatch)
+
+    async def broken_scorer(self, problem, agent_workdir, agent_answer_dir, container_name):
+        raise KeyError("expected_output")
+
+    monkeypatch.setattr(FakeBenchmark, "score_problem", broken_scorer)
+
+    result = run_one_problem(experiment)
+
+    assert result["error"] == "KeyError: 'expected_output'"
+
+
+def test_successful_results_have_no_error(experiment, docker):
+    assert run_one_problem(experiment)["error"] is None
+
+
+# Metadata is written atomically ------------------------------------------------------
+
+
+def test_metadata_updates_leave_no_temporary_files(exp_dir):
+    runner.update_metadata(exp_dir, generation=3)
+    asyncio.run(runner.update_benchmark_progress(exp_dir, "fake", "p0", 10))
+
+    assert sorted(p.name for p in exp_dir.iterdir()) == ["metadata.json"]
+    metadata = runner.load_metadata(exp_dir)
+    assert metadata["generation"] == 3
+    assert metadata["benchmark_progress"]["fake"]["problems_completed"] == ["p0"]
+
+
+def test_interrupted_metadata_write_keeps_the_previous_version(exp_dir, monkeypatch):
+    runner.update_metadata(exp_dir, generation=3)
+
+    def dump_then_die(data, f, **kwargs):
+        f.write('{"generation": 4, "pending_ag')
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner.json, "dump", dump_then_die)
+    with pytest.raises(OSError):
+        runner.update_metadata(exp_dir, generation=4)
+    monkeypatch.undo()
+
+    assert runner.load_metadata(exp_dir)["generation"] == 3
+    assert sorted(p.name for p in exp_dir.iterdir()) == ["metadata.json"]

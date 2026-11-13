@@ -29,6 +29,7 @@ from base_agent.src.utils.archive_analysis import (
     base_problem_id,
     result_id,
 )
+from base_agent.src.utils.usage import USAGE_FILENAME, read_usage
 from base_agent.src.utils.lineage import (
     STATUS_OK,
     STATUS_FAILED,
@@ -332,6 +333,18 @@ async def wait_for_container_ready(container_name: str, timeout: float = 30):
     )
 
 
+def write_json_atomic(path: Path, data) -> None:
+    """Write a JSON file so that it is either the old or the new version in
+    full: a crash while writing cannot leave a truncated file behind."""
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def load_metadata(exp_dir: Path) -> dict:
     """Load the experiment metadata, creating if doesn't exist"""
     metadata_file = exp_dir / "metadata.json"
@@ -356,8 +369,7 @@ def load_metadata(exp_dir: Path) -> dict:
         except subprocess.CalledProcessError:
             pass
 
-        with open(metadata_file, "w") as f:
-            json.dump(metadata, f, indent=2)
+        write_json_atomic(metadata_file, metadata)
     else:
         with open(metadata_file) as f:
             metadata = json.load(f)
@@ -368,8 +380,7 @@ def update_metadata(exp_dir: Path, **kwargs) -> None:
     """Update specific metadata fields"""
     metadata = load_metadata(exp_dir)
     metadata.update(kwargs)
-    with open(exp_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    write_json_atomic(exp_dir / "metadata.json", metadata)
 
 
 def resolve_selection_seed(exp_dir: Path, seed: int | None = None) -> int:
@@ -465,8 +476,7 @@ async def update_benchmark_progress(
             metadata["benchmark_progress"][benchmark_name]["completed"] += 1
 
         # Save metadata
-        with open(metadata_file, "w") as f:
-            json.dump(metadata, f, indent=2)
+        write_json_atomic(metadata_file, metadata)
 
 
 async def generate_contextual_summary(
@@ -618,6 +628,14 @@ async def process_job(
     timed_out = False
     cost_threshold_exceeded = False
 
+    async def record_failure(reason: str, **fields) -> None:
+        """Keep the reason with the problem's result. Its score stays unset,
+        so that it is attempted again when the experiment is resumed."""
+        async with benchmark_lock:
+            results_tracker.update_problem(
+                job.result_id, error=reason[-2000:], **fields
+            )
+
     # Create unique container name
     local_id = f"agent_{uuid4().hex[:8]}"
     container_name = f"sica_{benchmark.name}_{job.result_id}_{local_id}"
@@ -660,6 +678,7 @@ async def process_job(
             logger.error(
                 f"Failed to start container for {job.result_id}: {stderr}"
             )
+            await record_failure(f"Could not start container: {stderr}")
             return False
 
         await wait_for_container_ready(container_name)
@@ -702,6 +721,9 @@ async def process_job(
             agent_cmd += ["--timeout", str(TIMEOUT_SECONDS)]
             agent_cmd += ["--cost-threshold", str(COST_THRESHOLD_USD)]
 
+            # A report left by an earlier attempt must not be taken for this one's
+            (logdir / USAGE_FILENAME).unlink(missing_ok=True)
+
             try:
                 # An additional safety feature; if timeout cancellation
                 # doesn't happen at the application layer, we cancel
@@ -732,10 +754,18 @@ async def process_job(
 
             if not success:
                 logger.error(f"Problem {job.result_id} failed: {stderr}")
+                await record_failure(
+                    stderr or "The agent exited with an error", timed_out=timed_out
+                )
                 return False
 
             if not timed_out:
-                tokens, cached, cost, time = stdout.splitlines()[-1].split("|")
+                usage = read_agent_usage(logdir, stdout)
+                if usage is None:
+                    raise ValueError("The agent did not report its usage")
+                tokens, cached, cost, time = (
+                    usage["tokens"], usage["cached_tokens"], usage["cost"], usage["time"]
+                )  # fmt: skip
                 percent_cached = (
                     int(cached) / int(tokens) * 100 if int(tokens) > 0 else 0
                 )
@@ -777,6 +807,7 @@ async def process_job(
                     score=float(score),
                     timed_out=timed_out,
                     cost_threshold_exceeded=cost_threshold_exceeded,
+                    error=None,
                 )
 
             answer_path = logdir / "answer.txt"
@@ -820,6 +851,7 @@ async def process_job(
 
         except Exception as e:
             logger.error(f"Error processing problem {job.result_id}: {e}")
+            await record_failure(f"{type(e).__name__}: {e}")
             return False
     finally:
         # Cleanup running docker container
@@ -1024,6 +1056,12 @@ async def build_agent_image(tag: str, agent_code_dir: Path) -> tuple[bool, str]:
     build_cmd += ["-f", "sandbox/Dockerfile", "-t", tag, "--load", "sandbox"]
     success, _, stderr = await run_docker_command(*build_cmd)
     return success, stderr
+
+
+def read_agent_usage(logdir: Path, stdout: str) -> dict | None:
+    """What an agent run consumed: from the usage report in its log directory
+    or, for agents from before that existed, the last line of its output."""
+    return read_usage(logdir) or parse_usage(stdout)
 
 
 def parse_usage(stdout: str) -> dict | None:
@@ -1281,7 +1319,7 @@ async def run_meta_agent_benchmark(
             return
 
         # What it took to create this agent, for cost accounting
-        usage = parse_usage(stdout)
+        usage = read_agent_usage(meta_log_dir, stdout)
         if usage is None:
             logger.warning(f"Meta agent reported no usage for agent {child_id}")
             usage = {"tokens": 0, "cached_tokens": 0, "cost": 0.0, "time": 0.0}
@@ -1340,6 +1378,11 @@ async def run_meta_agent_benchmark(
             )
             if not fixed:
                 logger.warning(f"The fix attempt for agent {child_id} errored: {fix_stderr}")
+            # The fix is part of what it took to create this agent
+            fix_usage = read_usage(meta_log_dir / f"gate_fix_{fix_attempts}")
+            if fix_usage is not None:
+                usage = {key: usage[key] + fix_usage[key] for key in usage}
+                write_lineage(child_dir, usage=usage)
 
         # The agent is usable; anything that goes wrong from here on
         # (summaries) does not invalidate it.

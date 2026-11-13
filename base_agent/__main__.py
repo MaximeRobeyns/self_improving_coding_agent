@@ -15,6 +15,7 @@ import argparse
 from pathlib import Path
 
 from .agent import Agent
+from .src.utils.usage import write_usage
 
 logging.captureWarnings(True)
 logging.basicConfig(
@@ -107,6 +108,9 @@ async def run_benchmark(prompt_file: str, logdir: Path, timeout: int, cost_thres
 
     await agent.create_report()
 
+    # Report what the run consumed: as a file in the log directory, and (for
+    # runners that predate the file) as the last line of the output
+    write_usage(agent.logdir, total_tokens, cached_tokens, total_cost, duration)
     print(f"{total_tokens}|{cached_tokens}|{total_cost}|{duration}")
 
 
@@ -211,6 +215,9 @@ Submit as your answer a confirmation that you updated description.txt AND agent_
 
     await agent.create_report()
 
+    # Report what the run consumed: as a file in the log directory, and (for
+    # runners that predate the file) as the last line of the output
+    write_usage(agent.logdir, total_tokens, cached_tokens, total_cost, duration)
     print(f"{total_tokens}|{cached_tokens}|{total_cost}|{duration}")
 
 

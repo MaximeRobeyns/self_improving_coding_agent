@@ -24,6 +24,7 @@ from .src.agents.agent_calling import await_agent_task
 from .src.agents.implementations.main_orchestrator import MainOrchestratorAgent
 from .src.events.event_bus_utils import log_to_stdout
 from .src.config import settings
+from .src.utils.usage import write_usage
 from .src.types.event_types import EventType, Event
 
 
@@ -506,6 +507,7 @@ async def main():
         )
 
         await agent.create_report()
+        write_usage(agent.logdir, tokens, cached, cost, duration)
 
         # Print the execution trace for visual inspection
         cg = await CallGraphManager.get_instance()

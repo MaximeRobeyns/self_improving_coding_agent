@@ -151,7 +151,14 @@ class ParentSelector(Protocol):
 - `sandbox/GOOGLE_APPLICATION_CREDENTIALS.json`은 이미지에 COPY하지 않고 읽기 전용 마운트.
 - 기존 이미지에는 키가 레이어에 남아 있으므로 재빌드 후 이전 이미지를 삭제하도록 README에 안내.
 
-### 1-3. 설정 파일화 (F8)
+### 1-3. 설정 파일화 (F8) (구현 완료, F9 포함)
+
+구현 메모:
+- 설정 정의는 `runner_config.py`의 `RunnerSettings`(pydantic) 한 곳에 있다. 우선순위는 기본값 < `--config` YAML 파일 < 명령줄. 모든 설정에 명령줄 옵션이 있고 `run.example.yaml`이 전부를 설명한다.
+- 평가 설정(벤치마크, 문제 수, 한도, 반복, holdout, 단계)은 `metadata.json`의 `evaluation`에 저장되고 재개 시 유지된다. 문제 선택(`subset_size`, `benchmark_seed`, `holdout_fraction`)은 평가 결과가 생긴 뒤 바꿀 수 없다. 이번 실행에 쓴 전체 설정은 `runner_settings`에 남는다.
+- `benchmark_registry`에는 18개가 모두 등록되고, 실행할 것은 `benchmarks` 설정으로 고른다 (기본 `gsm8k`).
+- F9: utility 한도는 실험의 `timeout_s`/`cost_limit_usd`를 쓴다 (기록이 없는 아카이브는 기존 $3, 300초). 벤치마크 utility는 문제별 utility의 평균으로 바꿨다. 이전에는 벤치마크 전체 합계를 문제당 한도와 비교해 거의 항상 0이었다.
+- 시간 초과로 강제 종료된 실행은 남긴 답으로 채점해 확정한다 (`timed_out` 표시, 토큰·비용은 0). 이전에는 채점 분기에 도달하지 못해 재개할 때마다 다시 실행됐다.
 
 - `runner_config.py`(pydantic-settings, `base_agent/src/config.py`와 같은 방식): `timeout_s`, `cost_limit_usd`, `subset_size`, `seed`, `repeats`, `benchmarks: list[str]`, `workers`.
 - `--config run.yaml` + CLI 오버라이드. 사용한 설정 전체를 `metadata.json`에 저장.

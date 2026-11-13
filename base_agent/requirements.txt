@@ -1,4 +1,5 @@
 jsonlines
+pyyaml
 cryptography
 datasets
 tiktoken

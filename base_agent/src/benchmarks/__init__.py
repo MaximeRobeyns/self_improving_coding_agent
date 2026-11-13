@@ -28,26 +28,28 @@ from .aiq_project_benchmarks import (
     DistKVStoreAIQBenchmark,
 )
 
+# All available benchmarks, by name. Which of them an experiment runs is a
+# runner setting (`benchmarks`, by default just gsm8k).
 # Important, append new benchmarks to the end of this
 benchmark_registry: OrderedDict[str, Type[BaseBenchmark]] = OrderedDict(
     [
         (GSM8KBenchmark.name, GSM8KBenchmark),
-        # (DROPBenchmark.name, DROPBenchmark),
-        # (ARCAGIBenchmark.name, ARCAGIBenchmark),
-        # (MATHBenchmark.name, MATHBenchmark),
-        # (GSMICBenchmark.name, GSMICBenchmark),
-        # (FileEditingBenchmark.name, FileEditingBenchmark),
-        # (SWEBenchBenchmark.name, SWEBenchBenchmark),
-        # (HumanEvalBenchmark.name, HumanEvalBenchmark),
-        # (AIMEBenchmark.name, AIMEBenchmark),
-        # (GPQABenchmark.name, GPQABenchmark),
-        # (LiveCodeBenchmark.name, LiveCodeBenchmark),
-        # (SymbolLocationBenchmark.name, SymbolLocationBenchmark),
-        # (RefuteBenchmark.name, RefuteBenchmark),
-        # (AIQBenchmark.name, AIQBenchmark),
-        # (LinalgAIQBenchmark.name, LinalgAIQBenchmark),
-        # (CSVParsingAIQBenchmark.name, CSVParsingAIQBenchmark),
-        # (MessagingAppAIQBenchmark.name, MessagingAppAIQBenchmark),
-        # (DistKVStoreAIQBenchmark.name, DistKVStoreAIQBenchmark),
+        (DROPBenchmark.name, DROPBenchmark),
+        (ARCAGIBenchmark.name, ARCAGIBenchmark),
+        (MATHBenchmark.name, MATHBenchmark),
+        (GSMICBenchmark.name, GSMICBenchmark),
+        (FileEditingBenchmark.name, FileEditingBenchmark),
+        (SWEBenchBenchmark.name, SWEBenchBenchmark),
+        (HumanEvalBenchmark.name, HumanEvalBenchmark),
+        (AIMEBenchmark.name, AIMEBenchmark),
+        (GPQABenchmark.name, GPQABenchmark),
+        (LiveCodeBenchmark.name, LiveCodeBenchmark),
+        (SymbolLocationBenchmark.name, SymbolLocationBenchmark),
+        (RefuteBenchmark.name, RefuteBenchmark),
+        (AIQBenchmark.name, AIQBenchmark),
+        (LinalgAIQBenchmark.name, LinalgAIQBenchmark),
+        (CSVParsingAIQBenchmark.name, CSVParsingAIQBenchmark),
+        (MessagingAppAIQBenchmark.name, MessagingAppAIQBenchmark),
+        (DistKVStoreAIQBenchmark.name, DistKVStoreAIQBenchmark),
     ]
 )

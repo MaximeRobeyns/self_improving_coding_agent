@@ -636,15 +636,20 @@ def test_explicit_seed_is_used_and_stored(exp_dir):
     assert runner.resolve_selection_seed(exp_dir) == 0
 
 
+def settings_for(*argv):
+    """The settings that the runner would use for a command line"""
+    return runner.settings_from_args(runner.setup_argparse().parse_args(list(argv)))
+
+
 def test_selection_cli_arguments():
-    parser = runner.setup_argparse()
-    assert parser.parse_args([]).selection == "greedy_ci"
-    assert parser.parse_args([]).seed is None
-    assert parser.parse_args([]).children == 1
-    args = parser.parse_args(["--selection", "thompson", "--seed", "3", "--children", "4"])
-    assert (args.selection, args.seed, args.children) == ("thompson", 3, 4)
+    defaults = settings_for()
+    assert (defaults.selection, defaults.seed, defaults.children) == ("greedy_ci", None, 1)
+    settings = settings_for("--selection", "thompson", "--seed", "3", "--children", "4")
+    assert (settings.selection, settings.seed, settings.children) == ("thompson", 3, 4)
     with pytest.raises(SystemExit):
-        parser.parse_args(["--selection", "nope"])
+        settings_for("--selection", "nope")
+    with pytest.raises(ValueError, match="children"):
+        settings_for("--children", "0")
 
 
 # Evaluation: repeats, holdout, stages -------------------------------------------
@@ -655,12 +660,23 @@ from search.evaluation import EvaluationConfig, split_problems, stage1_problems
 N_FAKE_PROBLEMS = 10
 
 
+def fake_config(**kwargs):
+    """Evaluation settings for the one fake benchmark"""
+    return EvaluationConfig(benchmarks=("fake",), **kwargs)
+
+
 class FakeBenchmark(BaseBenchmark):
     name = "fake"
+    created_with: list[tuple] = []  # (seed, subset_size) of each instance
+
+    def __init__(self, seed=None, subset_size=None):
+        super().__init__(seed, subset_size)
+        FakeBenchmark.created_with.append((seed, subset_size))
 
     @property
     def problems(self):
-        return [Problem(f"p{i}", f"What is {i}?", str(i), None) for i in range(N_FAKE_PROBLEMS)]
+        n = self.subset_size or N_FAKE_PROBLEMS
+        return [Problem(f"p{i}", f"What is {i}?", str(i), None) for i in range(n)]
 
     async def score_problem(self, problem, agent_workdir, agent_answer_dir, container_name):
         return 1.0, None, None
@@ -669,6 +685,7 @@ class FakeBenchmark(BaseBenchmark):
 @pytest.fixture
 def fake_benchmark(monkeypatch):
     monkeypatch.setattr(runner, "benchmark_registry", {"fake": FakeBenchmark})
+    monkeypatch.setattr(FakeBenchmark, "created_with", [])
     return FakeBenchmark
 
 
@@ -678,6 +695,7 @@ def read_results(agent_results_dir):
 
 
 def run_queue(exp_dir, agent_id=0, **kwargs):
+    kwargs.setdefault("subset_size", 0)  # all of the fake problems
     asyncio.run(
         runner.run_benchmarks_with_job_queue(
             exp_dir, exp_dir / f"agent_{agent_id}", [FakeBenchmark], 3, **kwargs
@@ -779,15 +797,17 @@ class FakeQueue:
     def __init__(self, monkeypatch, scores_by_agent):
         self.scores_by_agent = scores_by_agent
         self.calls: list[dict] = []
+        self.settings: list[dict] = []  # the other settings of each call
         monkeypatch.setattr(runner, "run_benchmarks_with_job_queue", self)
         monkeypatch.setattr(runner, "run_docker_command", FakeDocker(fail={"image"}))
 
     async def __call__(
         self, exp_dir, agent_dir, benchmarks, workers,
-        image=None, results_exp_dir=None, select_problems=None, repeats=1,
+        image=None, results_exp_dir=None, select_problems=None, repeats=1, **settings,
     ):
+        self.settings.append(settings)
         agent_id = int(agent_dir.name.split("_")[1])
-        benchmark = benchmarks[0](seed=1, subset_size=18)
+        benchmark = benchmarks[0](seed=1, subset_size=None)
         selected = select_problems(benchmark) if select_problems else benchmark.problems
         results_root = results_exp_dir or exp_dir
         self.calls.append(
@@ -832,7 +852,7 @@ def fake_problem_ids(problem_list):
 def test_default_evaluation_is_one_full_run(experiment, fake_benchmark, monkeypatch):
     queue = FakeQueue(monkeypatch, {0: 1.0})
 
-    evaluate(experiment, 0, EvaluationConfig())
+    evaluate(experiment, 0, fake_config())
 
     assert queue.calls == [
         {
@@ -847,7 +867,7 @@ def test_default_evaluation_is_one_full_run(experiment, fake_benchmark, monkeypa
 
 def test_holdout_problems_are_run_separately(experiment, fake_benchmark, monkeypatch):
     queue = FakeQueue(monkeypatch, {0: 1.0})
-    config = EvaluationConfig(holdout_fraction=0.3, repeats=2, split_seed=7)
+    config = fake_config(holdout_fraction=0.3, repeats=2, split_seed=7)
 
     evaluate(experiment, 0, config)
 
@@ -869,7 +889,7 @@ def parent_and_children(experiment, fake_benchmark, monkeypatch):
     make_agent(experiment, 1, parent_id=0)
     make_agent(experiment, 2, parent_id=0)
     queue = FakeQueue(monkeypatch, {0: 1.0, 1: 1.0, 2: 0.0})
-    config = EvaluationConfig(stage1_size=4, holdout_fraction=0.2, split_seed=7)
+    config = fake_config(stage1_size=4, holdout_fraction=0.2, split_seed=7)
     evaluate(experiment, 0, config)
     queue.calls.clear()
     return experiment, queue, config
@@ -878,7 +898,7 @@ def parent_and_children(experiment, fake_benchmark, monkeypatch):
 def test_root_agent_is_always_evaluated_in_full(experiment, fake_benchmark, monkeypatch):
     queue = FakeQueue(monkeypatch, {0: 1.0})
 
-    evaluate(experiment, 0, EvaluationConfig(stage1_size=4))
+    evaluate(experiment, 0, fake_config(stage1_size=4))
 
     assert [len(c["problems"]) for c in queue.calls] == [N_FAKE_PROBLEMS]
 
@@ -959,13 +979,13 @@ def test_search_passes_the_evaluation_config_on(experiment, fake_benchmark, monk
 
     asyncio.run(
         runner.run_search(
-            1, experiment, 0, 2, config=EvaluationConfig(repeats=3)
+            1, experiment, 0, 2, config=fake_config(repeats=3)
         )
     )
     assert queue.calls == []  # no generations to run
 
     asyncio.run(
-        runner.evaluate_pending_agents(1, experiment, 2, EvaluationConfig(repeats=3))
+        runner.evaluate_pending_agents(1, experiment, 2, fake_config(repeats=3))
     )
     assert [c["repeats"] for c in queue.calls] == [3]
     assert runner.load_metadata(experiment)["pending_agents"] == []
@@ -1030,18 +1050,21 @@ def test_invalid_evaluation_settings_are_rejected(exp_dir):
 
 
 def test_evaluation_cli_arguments():
-    parser = runner.setup_argparse()
-    args = parser.parse_args([])
-    assert (args.repeats, args.holdout_fraction, args.stage1_size, args.promote_threshold) == (
+    unset = settings_for()
+    assert (unset.repeats, unset.holdout_fraction, unset.stage1_size, unset.promote_threshold) == (
         None, None, None, None,
     )
-    args = parser.parse_args(
-        ["--repeats", "3", "--holdout-fraction", "0.3", "--stage1-size", "8",
-         "--promote-threshold", "-0.1"]
+    settings = settings_for(
+        "--repeats", "3", "--holdout-fraction", "0.3", "--stage1-size", "8",
+        "--promote-threshold", "-0.1", "--benchmarks", "gsm8k", "humaneval",
+        "--subset-size", "0", "--benchmark-seed", "5", "--timeout-s", "900",
+        "--cost-limit-usd", "1.5",
     )
-    assert (args.repeats, args.holdout_fraction, args.stage1_size, args.promote_threshold) == (
-        3, 0.3, 8, -0.1,
-    )
+    assert (settings.repeats, settings.holdout_fraction, settings.stage1_size) == (3, 0.3, 8)
+    assert settings.promote_threshold == -0.1
+    assert settings.benchmarks == ["gsm8k", "humaneval"]
+    assert (settings.subset_size, settings.benchmark_seed) == (0, 5)
+    assert (settings.timeout_s, settings.cost_limit_usd) == (900, 1.5)
 
 
 # Meta agent and meta model ----------------------------------------------------
@@ -1131,16 +1154,15 @@ def test_search_plans_with_the_given_meta_agent_and_model(experiment, monkeypatc
 
 
 def test_meta_cli_arguments():
-    parser = runner.setup_argparse()
-    args = parser.parse_args([])
-    assert (args.meta_agent, args.meta_model) == ("best", None)
-    assert parser.parse_args(["--meta-agent", "parent"]).meta_agent == "parent"
-    assert parser.parse_args(["--meta-agent", "seed"]).meta_agent == "seed"
-    assert parser.parse_args(["--meta-agent", "3"]).meta_agent == 3
-    assert parser.parse_args(["--meta-model", "GPT4O"]).meta_model == "GPT4O"
+    defaults = settings_for()
+    assert (defaults.meta_agent, defaults.meta_model) == ("best", None)
+    assert settings_for("--meta-agent", "parent").meta_agent == "parent"
+    assert settings_for("--meta-agent", "seed").meta_agent == "seed"
+    assert settings_for("--meta-agent", "3").meta_agent == 3
+    assert settings_for("--meta-model", "GPT4O").meta_model == "GPT4O"
     for bad in (["--meta-agent", "strongest"], ["--meta-agent", "-1"], ["--meta-model", "nope"]):
         with pytest.raises(SystemExit):
-            parser.parse_args(bad)
+            settings_for(*bad)
 
 
 # Validation gate ----------------------------------------------------------------
@@ -1404,15 +1426,14 @@ def test_invalid_agents_are_not_evaluated(experiment, monkeypatch):
 
 
 def test_gate_cli_arguments():
-    parser = runner.setup_argparse()
-    args = parser.parse_args([])
-    assert (args.gate_checks, args.gate_retries, args.gate_model) == ("import,tests,smoke", 0, None)
-    args = parser.parse_args(
-        ["--gate-checks", "import,smoke", "--gate-retries", "2", "--gate-model", "GPT4O_MINI"]
+    assert settings_for().gate == GateConfig()
+    settings = settings_for(
+        "--gate-checks", "import,smoke", "--gate-retries", "2", "--gate-model", "GPT4O_MINI"
     )
-    assert GateConfig.parse_checks(args.gate_checks) == ("import", "smoke")
-    assert (args.gate_retries, args.gate_model) == (2, "GPT4O_MINI")
-    assert GateConfig.parse_checks(parser.parse_args(["--gate-checks", "none"]).gate_checks) == ()
+    assert settings.gate == GateConfig(checks=("import", "smoke"), retries=2, model="GPT4O_MINI")
+    assert not settings_for("--gate-checks", "none").gate.enabled
+    with pytest.raises(ValueError, match="gate_checks"):
+        settings_for("--gate-checks", "import,lint")
 
 
 # Credentials ------------------------------------------------------------------
@@ -1641,3 +1662,168 @@ def test_interrupted_metadata_write_keeps_the_previous_version(exp_dir, monkeypa
 
     assert runner.load_metadata(exp_dir)["generation"] == 3
     assert sorted(p.name for p in exp_dir.iterdir()) == ["metadata.json"]
+
+
+# Settings ---------------------------------------------------------------------
+
+
+def test_settings_come_from_file_and_command_line(tmp_path):
+    config = tmp_path / "run.yaml"
+    config.write_text("children: 3\nselection: thompson\ntimeout_s: 900\n")
+
+    settings = settings_for("--config", str(config), "--children", "2")
+
+    assert settings.children == 2  # the command line wins
+    assert settings.selection == "thompson"
+    assert settings.timeout_s == 900
+    with pytest.raises(ValueError, match="childern"):
+        config.write_text("childern: 3\n")
+        settings_for("--config", str(config))
+
+
+def test_every_setting_has_a_command_line_option():
+    parser = runner.setup_argparse()
+    options = {action.dest for action in parser._actions}
+    for name in runner.RunnerSettings.model_fields:
+        assert name in options, name
+
+
+def test_all_benchmarks_are_available_and_gsm8k_is_the_default():
+    from base_agent.src.benchmarks import benchmark_registry
+
+    assert len(benchmark_registry) == 18
+    assert all(name == cls.name for name, cls in benchmark_registry.items())
+    assert EvaluationConfig().benchmarks == ("gsm8k",)
+    assert "gsm8k" in benchmark_registry
+
+
+def test_evaluation_settings_reach_the_benchmark_runs(experiment, fake_benchmark, monkeypatch):
+    queue = FakeQueue(monkeypatch, {0: 1.0})
+    config = fake_config(subset_size=7, benchmark_seed=5, timeout_s=900, cost_limit_usd=1.5)
+
+    evaluate(experiment, 0, config)
+
+    assert queue.settings == [
+        {"subset_size": 7, "benchmark_seed": 5, "timeout_s": 900, "cost_limit_usd": 1.5}
+    ]
+
+
+def test_limits_and_problem_choice_are_applied(experiment, docker, fake_benchmark):
+    run_queue(experiment, subset_size=4, benchmark_seed=5, timeout_s=900, cost_limit_usd=1.5)
+
+    assert fake_benchmark.created_with == [(5, 4)]
+    assert len(read_results(experiment / "agent_0")) == 4
+    exec_cmd = [c for c in docker.calls_to("exec") if "benchmark" in c][0]
+    assert exec_cmd[exec_cmd.index("--timeout") + 1] == "900"
+    assert exec_cmd[exec_cmd.index("--cost-threshold") + 1] == "1.5"
+
+
+def test_subset_size_zero_means_all_problems(experiment, docker, fake_benchmark):
+    run_queue(experiment, subset_size=0)
+    assert fake_benchmark.created_with == [(1, None)]
+    assert len(read_results(experiment / "agent_0")) == N_FAKE_PROBLEMS
+
+
+def test_benchmarks_are_chosen_by_name(experiment, monkeypatch):
+    class Other(FakeBenchmark):
+        name = "other"
+
+    monkeypatch.setattr(runner, "benchmark_registry", {"fake": FakeBenchmark, "other": Other})
+    seen = []
+
+    async def queue(exp_dir, agent_dir, benchmarks, workers, **kwargs):
+        seen.append([b.name for b in benchmarks])
+
+    monkeypatch.setattr(runner, "run_benchmarks_with_job_queue", queue)
+    monkeypatch.setattr(runner, "run_docker_command", FakeDocker(fail={"image"}))
+
+    evaluate(experiment, 0, EvaluationConfig(benchmarks=("other", "fake")))
+    assert seen == [["other", "fake"]]
+
+    with pytest.raises(ValueError, match="Unknown benchmark.*nope"):
+        evaluate(experiment, 0, EvaluationConfig(benchmarks=("nope",)))
+
+
+def test_unknown_benchmark_is_rejected_with_the_available_ones(exp_dir):
+    with pytest.raises(ValueError, match="Unknown benchmark.*nope.*available:.*gsm8k"):
+        runner.resolve_evaluation_config(exp_dir, seed=1, benchmarks=["gsm8k", "nope"])
+
+
+def test_new_evaluation_settings_are_stored(exp_dir):
+    config = runner.resolve_evaluation_config(
+        exp_dir, seed=1, benchmarks=["humaneval", "gsm8k"], subset_size=0, timeout_s=900
+    )
+
+    assert config.benchmarks == ("humaneval", "gsm8k")
+    stored = runner.load_metadata(exp_dir)["evaluation"]
+    assert stored["benchmarks"] == ["humaneval", "gsm8k"]
+    assert (stored["subset_size"], stored["timeout_s"], stored["cost_limit_usd"]) == (0, 900, 3.0)
+    # Kept when the experiment is resumed without options
+    assert runner.resolve_evaluation_config(exp_dir, seed=1) == config
+
+
+def test_experiments_from_before_these_settings_get_the_old_constants(exp_dir):
+    runner.update_metadata(
+        exp_dir,
+        evaluation={"repeats": 2, "holdout_fraction": 0.0, "stage1_size": 0,
+                    "promote_threshold": 0.0, "split_seed": 3},
+    )
+    config = runner.resolve_evaluation_config(exp_dir, seed=1)
+    assert (config.repeats, config.split_seed) == (2, 3)
+    assert (config.subset_size, config.benchmark_seed, config.timeout_s) == (18, 1, 600)
+
+
+@pytest.mark.parametrize("setting, value", [("subset_size", 30), ("benchmark_seed", 2)])
+def test_choice_of_problems_cannot_change_once_agents_are_evaluated(exp_dir, setting, value):
+    runner.resolve_evaluation_config(exp_dir, seed=1)
+    (exp_dir / "agent_0" / "benchmarks").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match=f"{setting} of this experiment .* cannot be changed"):
+        runner.resolve_evaluation_config(exp_dir, seed=1, **{setting: value})
+
+
+def test_limits_and_benchmarks_can_change_later(exp_dir, caplog):
+    runner.resolve_evaluation_config(exp_dir, seed=1)
+    (exp_dir / "agent_0" / "benchmarks").mkdir(parents=True)
+
+    config = runner.resolve_evaluation_config(
+        exp_dir, seed=1, timeout_s=300, cost_limit_usd=1.0, benchmarks=["gsm8k", "humaneval"]
+    )
+
+    assert (config.timeout_s, config.cost_limit_usd) == (300, 1.0)
+    assert config.benchmarks == ("gsm8k", "humaneval")
+    assert "not comparable" in caplog.text
+
+
+# Runs that are cut off ----------------------------------------------------------
+
+
+def test_run_that_exceeds_its_time_limit_is_scored_and_final(experiment, monkeypatch):
+    class StuckDocker(FakeDocker):
+        async def __call__(self, *args):
+            if args[1] == "exec" and "benchmark" in args:
+                self.calls.append(args)
+                await asyncio.sleep(30)
+            return await super().__call__(*args)
+
+    docker = StuckDocker()
+    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(runner, "TIMEOUT_GRACE_SECONDS", 0)
+
+    async def no_answer(self, problem, agent_workdir, agent_answer_dir, container_name):
+        return 0.0, None, None
+
+    monkeypatch.setattr(FakeBenchmark, "score_problem", no_answer)
+
+    run_queue(experiment, select_problems=lambda b: b.problems[:1], timeout_s=0.05)
+
+    result = first_result(experiment)
+    assert (result["score"], result["timed_out"], result["error"]) == (0.0, True, None)
+    assert result["wall_time"] == 0.05
+    trace = experiment / "agent_0" / "benchmarks" / "fake" / "traces" / "p0" / "trace.txt"
+    assert "EXECUTION TIMED OUT" in trace.read_text()
+
+    # It counts as done: resuming does not run it again
+    n_runs = len(docker.commands_containing(" benchmark "))
+    run_queue(experiment, select_problems=lambda b: b.problems[:1], timeout_s=0.05)
+    assert len(docker.commands_containing(" benchmark ")) == n_runs

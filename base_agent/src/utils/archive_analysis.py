@@ -127,6 +127,22 @@ class ArchiveAnalyzer:
 
     def __init__(self, archive_root: Union[str, Path]):
         self.archive_root = Path(archive_root)
+        self.cost_limit, self.time_limit = self._read_limits()
+
+    def _read_limits(self) -> Tuple[float, float]:
+        """The per-problem cost and time limits that the archive's agents were
+        run with, which are what utility is judged against. Taken from the
+        experiment metadata, with the historical defaults for archives that
+        do not record them."""
+        cost_limit, time_limit = 3.0, 5 * 60.0
+        try:
+            with open(self.archive_root / "metadata.json") as f:
+                evaluation = json.load(f).get("evaluation") or {}
+            cost_limit = float(evaluation.get("cost_limit_usd", cost_limit))
+            time_limit = float(evaluation.get("timeout_s", time_limit))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return cost_limit, time_limit
 
     def _read_problem_trace(self, trace_dir: Path) -> tuple[str | None, str | None]:
         """Read the trace and summary from a problem trace directory."""
@@ -261,6 +277,7 @@ class ArchiveAnalyzer:
     def analyze_run(self) -> pd.DataFrame:
         """Get performance metrics for all iterations."""
         iterations = self._collect_iterations()
+        utilities = self._benchmark_utilities()
 
         data = []
         for iter_data in iterations:
@@ -298,7 +315,15 @@ class ArchiveAnalyzer:
                 )
                 total_problems = max(1, total_problems)
 
-                benchmark_scores.append(score.utility())
+                # The limits are per problem, so utility is judged per
+                # problem and averaged (the benchmark's total cost and time
+                # would exceed them for all but the smallest benchmarks)
+                benchmark_scores.append(
+                    utilities.get(
+                        (iter_data.iteration, bench_name),
+                        score.utility(self.cost_limit, self.time_limit),
+                    )
+                )
 
             # Calculate overall averages per problem
             row.update({
@@ -727,6 +752,19 @@ class ArchiveAnalyzer:
 
         return "\n".join(output)
 
+    def _benchmark_utilities(self) -> Dict[Tuple[int, str], float]:
+        """The utility of each (iteration, benchmark): the mean over its
+        problems of the utility of the problem."""
+        scores_df, _ = self.get_problem_scores_by_iteration()
+        if scores_df.empty:
+            return {}
+        means = (
+            per_problem_scores(scores_df, "utility")
+            .groupby(["iteration", "benchmark"])["utility"]
+            .mean()
+        )
+        return {(int(i), str(b)): float(v) for (i, b), v in means.items()}
+
     def get_improvement_trend(self) -> pd.DataFrame:
         """Analyze the trend of improvement across iterations."""
         df = self.analyze_run()
@@ -873,7 +911,7 @@ class ArchiveAnalyzer:
                                 cost=cost,
                                 time=time,
                                 timed_out=timed_out,
-                            ).utility()
+                            ).utility(self.cost_limit, self.time_limit)
 
                             repeat = result.get("repeat", 0) or 0
                             score_data = {
@@ -896,6 +934,19 @@ class ArchiveAnalyzer:
             except Exception as e:
                 logger.error(f"Error processing {agent_dir}: {e}")
                 continue
+
+        # A benchmark's utility is the mean utility of its problems (see
+        # analyze_run), where their results are available
+        if all_scores:
+            problem_utilities = (
+                per_problem_scores(pd.DataFrame(all_scores), "utility")
+                .groupby(["iteration", "benchmark"])["utility"]
+                .mean()
+            )
+            for summary in benchmark_summaries:
+                key = (summary["iteration"], summary["benchmark"])
+                if key in problem_utilities.index:
+                    summary["utility_score"] = float(problem_utilities[key])
 
         scores_df = pd.DataFrame(all_scores)
         summaries_df = pd.DataFrame(benchmark_summaries)

@@ -53,6 +53,7 @@ from search.selection import (
     selection_rng,
 )
 from search.changelog import render_other_branches, update_change_log
+from runner_config import META_AGENT_CHOICES, RunnerSettings, resolve_settings
 from search.gate import (
     AGENT_CODE_DIR,
     GateConfig,
@@ -97,6 +98,9 @@ SANDBOX_ENV_VARS = (
 GOOGLE_CREDENTIALS_FILE = Path("sandbox/GOOGLE_APPLICATION_CREDENTIALS.json")
 CONTAINER_GOOGLE_CREDENTIALS = "/tmp/GOOGLE_APPLICATION_CREDENTIALS.json"
 
+# How long a benchmark run may go over its time limit before it is cut off
+TIMEOUT_GRACE_SECONDS = 10
+
 # Limits for the meta agent when it is asked to fix an agent that failed the
 # validation gate
 GATE_FIX_TIMEOUT_SECONDS = 30 * 60
@@ -109,9 +113,6 @@ MONITOR_CONTAINER_PORT = 8080
 MONITOR_PORT_MAPPING = f"127.0.0.1::{MONITOR_CONTAINER_PORT}"
 
 # Utility functions ------------------------------------------------------------
-
-
-META_AGENT_CHOICES = ("best", "parent", "seed")
 
 
 def parse_meta_agent(value: str) -> str | int:
@@ -130,87 +131,122 @@ def parse_meta_agent(value: str) -> str | int:
 
 
 def setup_argparse() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Self referential agent")
+    """The command line. Options have no defaults here: an option that is not
+    given takes its value from the config file, or else its default, both of
+    which are in runner_config.RunnerSettings (see settings_from_args)."""
+    parser = argparse.ArgumentParser(
+        description="Self referential agent",
+        epilog="Every option can also be set in a YAML file given with --config "
+        "(see run.example.yaml); options on the command line take precedence.",
+    )
     parser.add_argument(
         "--experiment-id", "-id", type=int, help="ID of experiment to resume"
     )
-    parser.add_argument(
-        "--iterations", "-n", type=int, default=20, help="Number of iterations to run"
+    parser.add_argument("--config", type=Path, help="YAML file with settings")
+
+    search = parser.add_argument_group("search")
+    search.add_argument(
+        "--iterations", "-n", type=int, help="Number of iterations to run (default: 20)"
     )
-    parser.add_argument(
-        "--workers", type=int, default=8, help="Number of parallel problem workers"
+    search.add_argument(
+        "--workers", type=int, help="Number of parallel problem workers (default: 8)"
     )
-    parser.add_argument(
+    search.add_argument(
         "--children",
         type=int,
-        default=1,
-        help="Number of new agents to create per iteration, each from its own selected parent",
+        help="Number of new agents to create per iteration, each from its own selected parent (default: 1)",
     )
-    parser.add_argument(
+    search.add_argument(
         "--selection",
         choices=SELECTION_STRATEGIES,
-        default=DEFAULT_SELECTION_STRATEGY,
-        help="How to select the agent that the next agent is built from",
+        help=f"How to select the agent that the next agent is built from (default: {DEFAULT_SELECTION_STRATEGY})",
     )
-    parser.add_argument(
+    search.add_argument(
         "--seed",
         type=int,
         help="Seed for parent selection (default: the experiment's stored seed, or a new random one)",
     )
-    parser.add_argument(
+    search.add_argument(
         "--meta-agent",
         type=parse_meta_agent,
-        default="best",
         metavar="{best,parent,seed,<id>}",
         help="Which agent carries out the improvement of a new agent: the best-scoring "
         "agent (default), the new agent's parent, the initial agent, or a fixed agent id",
     )
-    parser.add_argument(
+    search.add_argument(
         "--meta-model",
         choices=[model.name for model in Model],
         metavar="MODEL",
         help="Model that the meta agent uses while improving an agent (default: the "
         "meta agent's own configured model). Benchmarks are unaffected.",
     )
-    parser.add_argument(
+
+    gate = parser.add_argument_group("validation gate")
+    gate.add_argument(
         "--gate-checks",
-        default="import,tests,smoke",
         metavar="CHECKS",
         help="Checks that a new agent must pass before it is evaluated, comma separated: "
         "import (its code imports), tests (its unit tests pass, unless its parent's "
         "did not either), smoke (it solves a trivial problem). 'none' switches the "
         "gate off (default: import,tests,smoke)",
     )
-    parser.add_argument(
+    gate.add_argument(
         "--gate-retries",
         type=int,
-        default=0,
         help="How often the meta agent is asked to fix a new agent that fails the gate (default: 0)",
     )
-    parser.add_argument(
+    gate.add_argument(
         "--gate-model",
         choices=[model.name for model in Model],
         metavar="MODEL",
         help="Model for the gate's smoke run (default: the agent's own configured model)",
     )
-    parser.add_argument(
+
+    evaluation = parser.add_argument_group(
+        "evaluation",
+        "Stored with the experiment: when resuming, options that are not given keep "
+        "their stored value. The choice of problems (--subset-size, --benchmark-seed, "
+        "--holdout-fraction) cannot be changed once agents have been evaluated.",
+    )
+    evaluation.add_argument(
+        "--benchmarks",
+        nargs="+",
+        metavar="NAME",
+        help="Benchmarks to run (default: gsm8k). Available: "
+        + ", ".join(benchmark_registry),
+    )
+    evaluation.add_argument(
+        "--subset-size",
+        type=int,
+        help="Number of problems to take from each benchmark; 0 for all (default: 18)",
+    )
+    evaluation.add_argument(
+        "--benchmark-seed", type=int, help="Seed of the choice of problems (default: 1)"
+    )
+    evaluation.add_argument(
+        "--timeout-s", type=int, help="Time limit per problem, in seconds (default: 600)"
+    )
+    evaluation.add_argument(
+        "--cost-limit-usd", type=float, help="Cost limit per problem, in USD (default: 3)"
+    )
+    evaluation.add_argument(
         "--repeats",
         type=int,
         help="Number of times to run each benchmark problem (default: 1)",
     )
-    parser.add_argument(
+    evaluation.add_argument(
         "--holdout-fraction",
         type=float,
         help="Share of each benchmark's problems to keep out of the archive that agents see; "
         "can only be set when an experiment is started (default: 0)",
     )
-    parser.add_argument(
+    evaluation.add_argument(
         "--stage1-size",
         type=int,
         help="Evaluate new agents on this many problems per benchmark first, and in full "
         "only if they are not clearly worse than their parent (default: 0, always in full)",
     )
-    parser.add_argument(
+    evaluation.add_argument(
         "--promote-threshold",
         type=float,
         help="With --stage1-size: evaluate in full unless the agent is worse than its "
@@ -225,6 +261,19 @@ def setup_argparse() -> argparse.ArgumentParser:
     test_parser.add_argument("--name", default="gsm8k", help="Benchmark ID to run")
 
     return parser
+
+
+def settings_from_args(args: argparse.Namespace) -> RunnerSettings:
+    """The settings of this invocation: defaults, overridden by the config
+    file, overridden by the command line.
+
+    Raises:
+        ValueError: if a setting is unknown or invalid
+    """
+    cli = {
+        name: getattr(args, name, None) for name in RunnerSettings.model_fields
+    }
+    return resolve_settings(args.config, cli)
 
 
 def get_next_dir_number(base_dir: str | Path) -> int:
@@ -401,40 +450,51 @@ def resolve_selection_seed(exp_dir: Path, seed: int | None = None) -> int:
     return seed
 
 
+# Evaluation settings that decide which problems agents are run on
+PROBLEM_CHOICE_SETTINGS = ("subset_size", "benchmark_seed", "holdout_fraction")
+
+
 def resolve_evaluation_config(
-    exp_dir: Path,
-    seed: int,
-    repeats: int | None = None,
-    holdout_fraction: float | None = None,
-    stage1_size: int | None = None,
-    promote_threshold: float | None = None,
+    exp_dir: Path, seed: int, **given
 ) -> EvaluationConfig:
     """How agents are evaluated in this experiment.
 
-    Settings not given keep the value stored with the experiment. The holdout
-    split is fixed once agents have been evaluated: changing it would show
-    held-out problems to the agents, and make results incomparable.
+    `given` holds evaluation settings (fields of EvaluationConfig) asked for
+    in this invocation; None or absent means not asked for. Those keep the
+    value stored with the experiment, or the default for a new experiment.
+
+    The choice of problems is fixed once agents have been evaluated: with
+    other problems, results would no longer be comparable between agents,
+    and held-out problems could end up in the archive that agents see.
 
     Raises:
-        ValueError: for invalid settings, or an attempt to change the split
+        ValueError: for invalid settings, unknown benchmarks, or an attempt
+            to change the choice of problems
     """
     stored = load_metadata(exp_dir).get("evaluation")
     current = EvaluationConfig(**stored) if stored else EvaluationConfig(split_seed=seed)
-    given = {
-        "repeats": repeats,
-        "holdout_fraction": holdout_fraction,
-        "stage1_size": stage1_size,
-        "promote_threshold": promote_threshold,
-    }
-    config = EvaluationConfig(
-        **{**current.to_dict(), **{k: v for k, v in given.items() if v is not None}}
-    )
-    has_results = any(exp_dir.glob("agent_*/benchmarks"))
-    if has_results and config.holdout_fraction != current.holdout_fraction:
+    asked = {key: value for key, value in given.items() if value is not None}
+    config = EvaluationConfig(**{**current.to_dict(), **asked})
+
+    unknown = [name for name in config.benchmarks if name not in benchmark_registry]
+    if unknown:
         raise ValueError(
-            f"The holdout fraction of this experiment is {current.holdout_fraction} and "
-            "cannot be changed now that agents have been evaluated"
+            f"Unknown benchmark(s) {', '.join(unknown)}; available: {', '.join(benchmark_registry)}"
         )
+
+    if any(exp_dir.glob("agent_*/benchmarks")):
+        for name in PROBLEM_CHOICE_SETTINGS:
+            old, new = getattr(current, name), getattr(config, name)
+            if old != new:
+                raise ValueError(
+                    f"{name} of this experiment is {old} and cannot be changed "
+                    f"(to {new}) now that agents have been evaluated"
+                )
+        if config.benchmarks != current.benchmarks:
+            logger.warning(
+                f"Benchmarks changed from {list(current.benchmarks)} to {list(config.benchmarks)}: "
+                "overall scores of agents evaluated before and after are not comparable"
+            )
     if config.to_dict() != stored:
         update_metadata(exp_dir, evaluation=config.to_dict())
     return config
@@ -583,14 +643,17 @@ async def process_job(
     worker_id: int,
     image: str = SANDBOX_IMAGE,
     results_exp_dir: Path | None = None,
+    timeout_s: int = 600,
+    cost_limit_usd: float = 3.0,
 ) -> bool:
     """Process a single benchmark problem job
 
     The results go to the agent's directory in `results_exp_dir`, which
     mirrors the layout of the experiment directory (and defaults to it).
+    `timeout_s` and `cost_limit_usd` are the limits for this one problem.
     """
-    TIMEOUT_SECONDS = 10 * 60  # 10 minutes timeout
-    COST_THRESHOLD_USD = 3.00  # 3 USD cost limit per problem
+    TIMEOUT_SECONDS = timeout_s
+    COST_THRESHOLD_USD = cost_limit_usd
 
     benchmark = job.benchmark
     problem = job.problem
@@ -728,7 +791,7 @@ async def process_job(
                 # An additional safety feature; if timeout cancellation
                 # doesn't happen at the application layer, we cancel
                 # the docker container
-                async with asyncio.timeout(TIMEOUT_SECONDS + 10):
+                async with asyncio.timeout(TIMEOUT_SECONDS + TIMEOUT_GRACE_SECONDS):
                     success, stdout, stderr = await run_docker_command(
                         "docker", "exec", container_name, *agent_cmd
                     )
@@ -752,11 +815,11 @@ async def process_job(
                 else:
                     trace_path.write_text(timeout_msg)
 
-            if not success:
+            # A run that had to be cut off is not a failed attempt to be
+            # repeated: it is scored on whatever answer it left, below.
+            if not success and not timed_out:
                 logger.error(f"Problem {job.result_id} failed: {stderr}")
-                await record_failure(
-                    stderr or "The agent exited with an error", timed_out=timed_out
-                )
+                await record_failure(stderr or "The agent exited with an error")
                 return False
 
             if not timed_out:
@@ -783,7 +846,8 @@ async def process_job(
                     f"{job.result_id} | tokens: {tokens} (cached: {percent_cached:.2f}%), cost: ${float(cost):.4f}, duration: {float(time):.2f}s"
                 )
             else:
-                # Use placeholder values for timeout cases that exceed grace period
+                # The run was cut off, so it did not report what it used: the
+                # time is known, tokens and cost are not
                 tokens, cached, cost, time = 0, 0, 0, str(TIMEOUT_SECONDS)
 
             # Score the answer
@@ -912,6 +976,10 @@ async def run_benchmarks_with_job_queue(
     results_exp_dir: Path | None = None,
     select_problems=None,
     repeats: int = 1,
+    subset_size: int = 18,
+    benchmark_seed: int = 1,
+    timeout_s: int = 600,
+    cost_limit_usd: float = 3.0,
 ) -> None:
     """Run multiple benchmarks concurrently using a job queue approach
 
@@ -920,6 +988,10 @@ async def run_benchmarks_with_job_queue(
         select_problems: Given a benchmark, returns the problems of it to run
             (default: all of them)
         repeats: Number of times to run each problem
+        subset_size: Number of problems to take from each benchmark (0: all)
+        benchmark_seed: Seed of that choice of problems
+        timeout_s: Time limit for a problem
+        cost_limit_usd: Cost limit for a problem
     """
     results_exp_dir = results_exp_dir or exp_dir
     results_agent_dir = results_exp_dir / agent_dir.name
@@ -941,8 +1013,7 @@ async def run_benchmarks_with_job_queue(
     benchmarks_dict = {}
 
     for benchmark_cls in benchmarks:
-        benchmark = benchmark_cls(seed=1, subset_size=18)
-        # benchmark = benchmark_cls(seed=1, subset_size=None)  # For full benchmarks
+        benchmark = benchmark_cls(seed=benchmark_seed, subset_size=subset_size or None)
         logger.info(f"Initializing benchmark: {benchmark.name}")
 
         benchmark_dir = results_agent_dir / "benchmarks" / benchmark.name
@@ -997,7 +1068,14 @@ async def run_benchmarks_with_job_queue(
                     # Process the job
                     logger.info(f"Worker {worker_id} processing job {job}")
                     await process_job(
-                        exp_dir, agent_dir, job, worker_id, image, results_exp_dir
+                        exp_dir,
+                        agent_dir,
+                        job,
+                        worker_id,
+                        image,
+                        results_exp_dir,
+                        timeout_s,
+                        cost_limit_usd,
                     )
                 except Exception as e:
                     logger.error(f"Error in worker {worker_id} processing {job}: {e}")
@@ -1592,9 +1670,21 @@ async def evaluate_agent(
     with their results kept outside of the experiment directory.
     """
     agent_dir = exp_dir / f"agent_{agent_id}"
-    benchmarks = list(benchmark_registry.values())
+    unknown = [name for name in config.benchmarks if name not in benchmark_registry]
+    if unknown:
+        raise ValueError(f"Unknown benchmark(s): {', '.join(unknown)}")
+    benchmarks = [benchmark_registry[name] for name in config.benchmarks]
     image = await resolve_agent_image(exp_id, agent_id)
     seed = config.split_seed
+    # How every benchmark run of this agent is made
+    run_settings = dict(
+        image=image,
+        repeats=config.repeats,
+        subset_size=config.subset_size,
+        benchmark_seed=config.benchmark_seed,
+        timeout_s=config.timeout_s,
+        cost_limit_usd=config.cost_limit_usd,
+    )
 
     def dev(benchmark: BaseBenchmark) -> list[Problem]:
         return split_problems(
@@ -1621,9 +1711,8 @@ async def evaluate_agent(
             agent_dir,
             benchmarks,
             workers,
-            image=image,
             select_problems=stage1,
-            repeats=config.repeats,
+            **run_settings,
         )
         delta = ArchiveAnalyzer(exp_dir).paired_delta(agent_id, parent_id)
         evaluation = {
@@ -1657,9 +1746,8 @@ async def evaluate_agent(
         agent_dir,
         benchmarks,
         workers,
-        image=image,
         select_problems=dev,
-        repeats=config.repeats,
+        **run_settings,
     )
     if config.holdout_fraction > 0:
         logger.info(f"Running held-out benchmarks for agent {agent_id}")
@@ -1668,10 +1756,9 @@ async def evaluate_agent(
             agent_dir,
             benchmarks,
             workers,
-            image=image,
             results_exp_dir=holdout_dir(exp_dir),
             select_problems=holdout,
-            repeats=config.repeats,
+            **run_settings,
         )
 
 
@@ -1788,6 +1875,10 @@ async def main():
     parser = setup_argparse()
     args = parser.parse_args()
     logger.debug(f"Setup parser: {args}")
+    try:
+        settings = settings_from_args(args)
+    except ValueError as e:
+        parser.error(str(e))
 
     # Either get the specified experiment id, or get the next one
     exp_id = args.experiment_id or get_next_dir_number("results")
@@ -1797,6 +1888,22 @@ async def main():
     if not exp_dir.exists():
         initialise_experiment(exp_dir)
         logger.info(f"Initialized experiment {exp_id} in {exp_dir}")
+
+    selection_seed = resolve_selection_seed(exp_dir, settings.seed)
+    try:
+        config = resolve_evaluation_config(
+            exp_dir,
+            selection_seed,
+            **{
+                name: getattr(settings, name)
+                for name in EvaluationConfig.__dataclass_fields__
+                if name in RunnerSettings.model_fields
+            },
+        )
+        check_meta_agent(exp_dir, settings.meta_agent)
+        gate = settings.gate
+    except ValueError as e:
+        parser.error(str(e))
 
     # Handle test mode
     if args.command == "test":
@@ -1817,15 +1924,17 @@ async def main():
             exp_dir,
             latest_agent,
             [benchmark_cls],
-            args.workers,
+            settings.workers,
             image=await resolve_agent_image(
                 exp_id, int(latest_agent.name.split("_")[1])
             ),
+            repeats=config.repeats,
+            subset_size=config.subset_size,
+            benchmark_seed=config.benchmark_seed,
+            timeout_s=config.timeout_s,
+            cost_limit_usd=config.cost_limit_usd,
         )
         return
-
-    if args.children < 1:
-        parser.error("--children must be at least 1")
 
     passed_on = [name for name in SANDBOX_ENV_VARS if os.environ.get(name)]
     if passed_on:
@@ -1836,50 +1945,30 @@ async def main():
             f"not be able to call any model ({', '.join(SANDBOX_ENV_VARS)})"
         )
 
-    selection_seed = resolve_selection_seed(exp_dir, args.seed)
-    logger.info(
-        f"Parent selection: {args.selection} (seed {selection_seed}), "
-        f"{args.children} new agent(s) per iteration"
+    # Keep a record of what this invocation was run with
+    update_metadata(
+        exp_dir, runner_settings={**settings.model_dump(), "seed": selection_seed}
     )
-    try:
-        config = resolve_evaluation_config(
-            exp_dir,
-            selection_seed,
-            repeats=args.repeats,
-            holdout_fraction=args.holdout_fraction,
-            stage1_size=args.stage1_size,
-            promote_threshold=args.promote_threshold,
-        )
-    except ValueError as e:
-        parser.error(str(e))
+    logger.info(
+        f"Parent selection: {settings.selection} (seed {selection_seed}), "
+        f"{settings.children} new agent(s) per iteration"
+    )
     logger.info(f"Evaluation: {config}")
-    try:
-        check_meta_agent(exp_dir, args.meta_agent)
-    except ValueError as e:
-        parser.error(str(e))
     logger.info(
-        f"Meta agent: {args.meta_agent}, model: {args.meta_model or 'its own default'}"
+        f"Meta agent: {settings.meta_agent}, model: {settings.meta_model or 'its own default'}"
     )
-    try:
-        gate = GateConfig(
-            checks=GateConfig.parse_checks(args.gate_checks),
-            retries=args.gate_retries,
-            model=args.gate_model,
-        )
-    except ValueError as e:
-        parser.error(str(e))
     logger.info(f"Validation gate: {gate}")
     await run_search(
         exp_id,
         exp_dir,
-        args.iterations,
-        args.workers,
-        n_children=args.children,
-        selection=args.selection,
+        settings.iterations,
+        settings.workers,
+        n_children=settings.children,
+        selection=settings.selection,
         seed=selection_seed,
         config=config,
-        meta_agent=args.meta_agent,
-        meta_model=args.meta_model,
+        meta_agent=settings.meta_agent,
+        meta_model=settings.meta_model,
         gate=gate,
     )
 

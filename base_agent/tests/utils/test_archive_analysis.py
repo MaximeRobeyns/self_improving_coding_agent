@@ -551,3 +551,81 @@ def test_repeats_are_runs_of_the_same_problem(test_archive):
     delta = analyzer.paired_delta(1, 0)
     assert delta.n_problems == 8
     assert delta.mean == pytest.approx((2 / 3) / 4 / 2)
+
+
+# Utility ------------------------------------------------------------------------
+
+
+def utility_archive(tmp_path, results, evaluation=None):
+    """One agent, one benchmark, with the given (score, cost, time) results."""
+    bench_dir = tmp_path / "agent_0" / "benchmarks" / "gsm8k"
+    bench_dir.mkdir(parents=True)
+    rows = [
+        {
+            "problem_id": f"p{n}",
+            "score": score,
+            "tokens_used": 1,
+            "num_cached_tokens": 0,
+            "cost_estimate": cost,
+            "wall_time": time,
+            "timed_out": False,
+        }
+        for n, (score, cost, time) in enumerate(results)
+    ]
+    (bench_dir / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    perf = {
+        "avg_score": sum(r["score"] for r in rows) / len(rows),
+        "tokens": len(rows),
+        "num_cached_tokens": 0,
+        "cost": sum(r["cost_estimate"] for r in rows),
+        "time": sum(r["wall_time"] for r in rows),
+    }
+    (bench_dir / "perf.json").write_text(json.dumps(perf))
+    if evaluation is not None:
+        (tmp_path / "metadata.json").write_text(json.dumps({"evaluation": evaluation}))
+    return ArchiveAnalyzer(tmp_path)
+
+
+def test_utility_is_judged_per_problem(tmp_path):
+    # 20 cheap, quick, solved problems. Together they cost $10 and take 1000s,
+    # far over the per-problem limits ($3, 300s) that used to be applied to
+    # the benchmark's totals, giving a utility of 0.
+    analyzer = utility_archive(tmp_path, [(1.0, 0.5, 50.0)] * 20)
+
+    assert analyzer.analyze_run().loc[0, "utility_score"] == 1.0
+    _, summaries = analyzer.get_problem_scores_by_iteration()
+    assert summaries["utility_score"].tolist() == [1.0]
+
+
+def test_utility_discounts_problems_over_their_limits(tmp_path):
+    analyzer = utility_archive(
+        tmp_path,
+        [
+            (1.0, 0.5, 50.0),  # fine
+            (1.0, 5.0, 50.0),  # too expensive
+            (1.0, 0.5, 400.0),  # too slow
+            (0.0, 0.5, 50.0),  # not solved
+        ],
+    )
+    assert analyzer.analyze_run().loc[0, "utility_score"] == 0.25
+    assert analyzer.analyze_run().loc[0, "gsm8k_score"] == 0.75
+
+
+def test_utility_limits_are_those_of_the_experiment(tmp_path):
+    results = [(1.0, 0.5, 400.0), (1.0, 2.0, 50.0)]
+    assert utility_archive(tmp_path / "a", results).analyze_run().loc[0, "utility_score"] == 0.5
+
+    # An experiment run with a 600s time limit and a $1 cost limit
+    analyzer = utility_archive(
+        tmp_path / "b", results, evaluation={"timeout_s": 600, "cost_limit_usd": 1.0}
+    )
+    assert (analyzer.cost_limit, analyzer.time_limit) == (1.0, 600.0)
+    assert analyzer.analyze_run().loc[0, "utility_score"] == 0.5  # the other one now
+    scores, _ = analyzer.get_problem_scores_by_iteration()
+    assert scores["utility"].tolist() == [1.0, 0.0]
+
+
+def test_limits_default_for_archives_without_them(tmp_path):
+    (tmp_path / "metadata.json").write_text("{not json")
+    assert (ArchiveAnalyzer(tmp_path).cost_limit, ArchiveAnalyzer(tmp_path).time_limit) == (3.0, 300.0)
+    assert ArchiveAnalyzer(tmp_path / "missing").time_limit == 300.0

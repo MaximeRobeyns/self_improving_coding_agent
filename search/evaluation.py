@@ -21,8 +21,20 @@ if TYPE_CHECKING:
     from base_agent.src.benchmarks.base import Problem
 
 
+DEFAULT_BENCHMARKS = ("gsm8k",)
+
+
 @dataclass(frozen=True)
 class EvaluationConfig:
+    # Names of the benchmarks to run
+    benchmarks: tuple[str, ...] = DEFAULT_BENCHMARKS
+    # Problems taken from each benchmark (0: all of them), and the seed of
+    # that choice
+    subset_size: int = 18
+    benchmark_seed: int = 1
+    # Limits for a single problem
+    timeout_s: int = 600
+    cost_limit_usd: float = 3.0
     # Number of times each problem is run
     repeats: int = 1
     # Share of each benchmark's problems that is kept out of the archive, and
@@ -37,6 +49,14 @@ class EvaluationConfig:
     split_seed: int = 0
 
     def __post_init__(self):
+        # Stored as a list in JSON
+        object.__setattr__(self, "benchmarks", tuple(self.benchmarks))
+        if not self.benchmarks:
+            raise ValueError("at least one benchmark is needed")
+        if self.subset_size < 0:
+            raise ValueError("subset_size must not be negative")
+        if self.timeout_s <= 0 or self.cost_limit_usd <= 0:
+            raise ValueError("timeout_s and cost_limit_usd must be positive")
         if self.repeats < 1:
             raise ValueError("repeats must be at least 1")
         if not 0.0 <= self.holdout_fraction < 1.0:
@@ -45,7 +65,7 @@ class EvaluationConfig:
             raise ValueError("stage1_size must not be negative")
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {**asdict(self), "benchmarks": list(self.benchmarks)}
 
 
 def holdout_dir(exp_dir: Path) -> Path:

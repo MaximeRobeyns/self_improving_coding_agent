@@ -1,0 +1,34 @@
+# Example settings for runner.py:
+#
+#   python runner.py --config run.example.yaml
+#
+# Every setting is optional, and can also be given on the command line, where
+# '_' is written '-' (--stage1-size 8). The command line wins over this file.
+
+# --- The search ---------------------------------------------------------------
+iterations: 20            # generations to run
+workers: 8                # benchmark problems run in parallel
+children: 3               # new agents per generation
+selection: score_child_prop   # greedy_ci | score_child_prop | thompson
+# seed: 1                 # of parent selection; random for a new experiment if unset
+meta_agent: best          # best | parent | seed | <agent id>
+# meta_model: SONNET_37   # model the meta agent uses for the improvement
+
+# --- The validation gate ---------------------------------------------------------
+gate_checks: [import, tests, smoke]   # or 'none'
+gate_retries: 1           # times the meta agent may fix an agent that fails
+# gate_model: HAIKU_35    # model for the smoke run
+
+# --- The evaluation -----------------------------------------------------------
+# These are stored with the experiment and kept when it is resumed. The
+# problems themselves (subset_size, benchmark_seed, holdout_fraction) cannot
+# be changed once agents have been evaluated.
+benchmarks: [gsm8k]       # names as in base_agent/src/benchmarks/__init__.py
+subset_size: 18           # problems per benchmark; 0 for all of them
+benchmark_seed: 1         # of the choice of problems
+timeout_s: 600            # per problem
+cost_limit_usd: 3.0       # per problem
+repeats: 1                # runs of each problem
+holdout_fraction: 0.0     # share of problems the agents never see
+stage1_size: 0            # problems per benchmark in a first stage; 0 for none
+promote_threshold: 0.0    # see --help

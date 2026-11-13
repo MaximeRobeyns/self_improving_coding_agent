@@ -92,9 +92,13 @@ To further configure the agent, including the choice of LLMs, edit `base_agent/s
 
 ## Self-Improvement Loop
 
-To run the self-improvement loop, first inspect the list of benchmarks in the `base_agent/src/benchmarks/__init__.py` file, and make sure that you have uncommented those you want to include. Then do
+To run the self-improvement loop, do
 ```bash
 python runner.py
+```
+This runs the `gsm8k` benchmark. To run others, name them (`python runner.py --help` lists those available, which are defined in `base_agent/src/benchmarks/__init__.py`):
+```bash
+python runner.py --benchmarks gsm8k humaneval file_editing
 ```
 To see all the options, do
 ```bash
@@ -106,6 +110,11 @@ python runner.py --id 1 --workers 6
 ```
 
 This will start the agent loop, placing the results in `results/run_<id>`.
+
+Instead of a long command line, settings can be kept in a YAML file. `run.example.yaml` lists all of them with their defaults; options given on the command line take precedence over the file.
+```bash
+python runner.py --config run.example.yaml --children 2
+```
 
 By default each new agent is built from the latest agent that is not significantly worse than the best one (`greedy_ci`). Two sampling strategies are also available, which spread the search over more of the archive:
 ```bash
@@ -139,7 +148,9 @@ python runner.py --stage1-size 8        # try new agents on 8 problems per bench
 - With `--holdout-fraction`, results on the held-out problems go to `results/holdout/run_<id>/` (same layout as the experiment directory). Agents never see them, so a gain that shows up on the archive problems but not on the held-out ones is overfitting. The split can only be chosen when an experiment is started.
 - With `--stage1-size`, an agent that is clearly worse than its parent on the first-stage problems is not evaluated further and not built upon (`--promote-threshold` sets how much worse is tolerated).
 
-These settings are stored with the experiment and kept when it is resumed.
+Each problem has a time and a cost limit (`--timeout-s`, default 600; `--cost-limit-usd`, default 3), and `--subset-size` sets how many problems are taken from each benchmark (default 18; 0 for all).
+
+These settings are stored with the experiment and kept when it is resumed. The choice of problems (`--subset-size`, `--benchmark-seed`, `--holdout-fraction`) cannot be changed once agents have been evaluated.
 
 To see how an experiment went (the tree of agents, progress and cost per generation, archive vs held-out scores, and how parents were selected), or how much several experiments differ from run to run:
 ```bash

@@ -175,13 +175,27 @@ class ParentSelector(Protocol):
 - `update_metadata`를 임시 파일 + `os.replace`로 원자적 쓰기.
 - `process_job` 실패 경로(`return False`)에서 실패 사유를 `results.jsonl`에 기록. 지금은 로그에만 남아 재개 시 원인을 알 수 없다.
 
-### 1-5. 모델·SDK 갱신 (F12)
+### 1-5. 모델·SDK 갱신 (F12) (모델 갱신 구현, SDK 업그레이드는 보류)
+
+구현 메모:
+- 기본값이던 Claude 3.x 모델(Sonnet 3.7/3.5, Haiku 3.5)은 Claude API에서 이미 은퇴해 요청이 실패한다. `HAIKU_55`, `SONNET_55`, `OPUS_55`를 추가하고 기본 모델을 `SONNET_55`로 바꿨다. 옛 항목은 과거 run 분석용으로 남기고 failover는 현행 모델로 돌렸다.
+- 현행 모델은 세 가지를 400으로 거부한다: assistant 턴으로 끝나는 요청(prefill), `temperature`/`top_p`, thinking 토큰 예산. 에이전트 루프가 "지금까지의 작업을 assistant 턴으로 보내고 이어 쓰게 하는" 구조라서 첫 번째가 핵심이다. `ModelInfo`에 능력 플래그(`supports_prefill`, `supports_sampling_params`, `adaptive_thinking`)를 두고 provider가 그에 맞춰 요청을 만든다. prefill을 못 받는 모델에는 이어서 진행하라는 user 턴을 끝에 붙이고, 캐시 분기점은 그 앞(작업 내용)에 둔다.
+- 리뷰 위원회와 위원의 하드코딩 모델을 `settings.MODEL`로 바꿨다.
+- 실제 API 검증: `base_agent/tests/llm/test_anthropic_live.py`(`--run-llm`)가 `SONNET_55`로 통과했다 (첫 단계 요청, assistant 턴으로 끝나는 요청, stop sequence, effort, 캐시 읽기). 에이전트의 도구 호출 루프 전체와 Docker 안 실행은 아직 돌려보지 않았다. SDK는 `anthropic==0.42.0` 고정을 유지했다: 1.x는 HTTP 계층이 바뀌는 호환성 깨지는 업그레이드라 실제 호출 없이 올릴 수 없다. `effort`는 이 SDK가 모르는 파라미터라 `extra_body`로 보낸다.
+- 가격은 Anthropic 1st-party API 기준. cache write는 입력가의 1.25배로 계산했고, Haiku 5.5의 100K 토큰 초과 구간 요금은 반영하지 않았다.
+- OpenAI/Google/DeepSeek 모델 목록은 건드리지 않았다 (`REASONING_MODEL` 기본값 `O3_MINI`, runner 요약용 `GEMINI_FLASH_2` 포함).
 
 - `Model` enum에 현재 모델 추가, `config.py` 기본값 교체, `FALLBACK` 표 정리.
 - `anthropic` 버전 고정 해제 후 `providers/anthropic.py`(897줄) 회귀 확인. 토큰 단가는 추가 전 공식 가격표에서 확인한다.
 - 구형 모델 항목은 과거 run 재분석을 위해 남긴다.
 
-### 1-6. CI와 정리 (F13)
+### 1-6. CI와 정리 (F13) (구현 완료)
+
+구현 메모:
+- `runner.py`는 진입점만 남기고 구현을 `orchestrator/` 패키지로 옮겼다: `cli`, `loop`, `evaluation`, `creation`, `state`, `containers`. (계획의 `runner/`라는 이름은 `runner.py`와 함께 둘 수 없다.)
+- SWE-bench harness를 쓰는 곳에서만 import하도록 바꿨다. 이전에는 벤치마크 패키지를 import하는 모든 코드가 harness 버전에 묶여 있어 `runner.py`조차 import되지 않는 환경이 있었다.
+- `base_agent` 테스트의 기존 오류 18개를 고쳤다: async fixture 처리(`asyncio_mode = auto`)와, 존재하지 않는 `CallGraphManager.reset()` 호출·이미 풀린 fixture를 다시 await하던 낡은 테스트 코드.
+- CI(`.github/workflows/ci.yml`)는 ruff + 두 테스트 스위트를 돌린다. ruff는 확실한 버그(문법 오류, 정의되지 않은 이름)만 검사한다. 전체 lint 규칙은 기존 코드에서 150건 이상 걸려 켜지 않았다.
 
 - GitHub Actions: `ruff check` + `pytest base_agent` (API 호출 없는 테스트만).
 - `runner.py`의 주석 처리된 옛 코드 블록 삭제 (`786-796`, `810-817`, `841-846`, `915-927`).

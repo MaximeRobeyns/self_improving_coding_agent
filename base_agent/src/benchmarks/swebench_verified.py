@@ -15,12 +15,10 @@ from dataclasses import dataclass
 
 from .base import BaseBenchmark, Problem
 
-# Import SWE-bench constants and functions; install from source in ./third_party/SWE-bench
-from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS, MAP_REPO_TO_EXT
-from swebench.harness.test_spec.python import (
-    make_env_script_list_py,
-    make_repo_script_list_py,
-)
+# The SWE-bench harness is imported where it is used (setup_problem), not
+# here: this module is imported whenever any benchmark is, and the harness is
+# a large dependency whose layout differs between versions. Only running this
+# benchmark needs it.
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -272,6 +270,13 @@ class SWEBenchBenchmark(BaseBenchmark):
                 if stdout.strip():
                     logger.debug(f"stdout:\n{stdout}")
                 return stdout
+
+            # Install the harness from source: scripts/install_swebench_harness.sh
+            from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS
+            from swebench.harness.test_spec.python import (
+                make_env_script_list_py,
+                make_repo_script_list_py,
+            )
 
             # Get repository-specific setup from SWE-bench constants
             repo_specs = MAP_REPO_VERSION_TO_SPECS.get(example.repo, {})

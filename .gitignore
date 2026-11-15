@@ -160,3 +160,11 @@ benchmark_data/aiq_bench
 benchmark_data/file_editing_bench
 benchmark_data/symbol_location_bench
 check_boilerplate.sh
+
+# Local tooling
+.DS_Store
+.omc/
+.bkit/
+
+results/
+

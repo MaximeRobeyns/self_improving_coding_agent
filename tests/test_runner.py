@@ -1,15 +1,19 @@
-"""Tests for the host-side runner. Run from the repo root: pytest tests"""
+"""Tests for the host-side runner (the orchestrator package).
+
+Run from the repo root: pytest tests
+"""
+import json
+from pathlib import Path
 import shutil
 import asyncio
 
-import json
-from pathlib import Path
 import pytest
 
-try:
-    import runner
-except ImportError as e:  # e.g. the SWE-bench harness is not installed from source
-    pytest.skip(f"runner.py is not importable here: {e}", allow_module_level=True)
+from base_agent.src.utils import lineage
+from base_agent.src.utils.archive_analysis import ArchiveAnalyzer
+from orchestrator import cli, containers, creation, evaluation, loop, state
+from runner_config import RunnerSettings
+from search.evaluation import holdout_dir
 
 
 # get_container_host_port ------------------------------------------------------
@@ -33,9 +37,9 @@ def test_get_container_host_port(monkeypatch, docker_output, expected):
         calls.append(args)
         return docker_output
 
-    monkeypatch.setattr(runner, "run_docker_command", fake_docker)
+    monkeypatch.setattr(containers, "run_docker_command", fake_docker)
 
-    port = asyncio.run(runner.get_container_host_port("some_container"))
+    port = asyncio.run(containers.get_container_host_port("some_container"))
 
     assert port == expected
     assert calls == [("docker", "port", "some_container", "8080/tcp")]
@@ -43,7 +47,7 @@ def test_get_container_host_port(monkeypatch, docker_output, expected):
 
 def test_monitor_port_mapping_lets_docker_pick_the_host_port():
     # No fixed host port: concurrent containers must not collide
-    assert runner.MONITOR_PORT_MAPPING == "127.0.0.1::8080"
+    assert containers.MONITOR_PORT_MAPPING == "127.0.0.1::8080"
 
 
 # Fixtures --------------------------------------------------------------------
@@ -132,7 +136,7 @@ def make_agent(exp_dir, agent_id, parent_id=None, status="ok", description=None)
     (code_dir / "agent_change_log.md").write_text(f"# log of agent {agent_id}\n")
     (code_dir / "description.txt").write_text(description or f"Agent {agent_id}")
     if parent_id is not ...:
-        runner.write_lineage(
+        lineage.write_lineage(
             exp_dir / f"agent_{agent_id}", id=agent_id, parent_id=parent_id, status=status
         )
     return exp_dir / f"agent_{agent_id}"
@@ -174,22 +178,22 @@ def experiment(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     exp_dir = tmp_path / "results" / "run_1"
     exp_dir.mkdir(parents=True)
-    runner.load_metadata(exp_dir)
+    state.load_metadata(exp_dir)
     make_agent(exp_dir, 0)
 
     async def fake_summary(*args, **kwargs):
         return "summary"
 
-    monkeypatch.setattr(runner, "generate_contextual_summary", fake_summary)
+    monkeypatch.setattr(evaluation, "generate_contextual_summary", fake_summary)
     # Benchmark jobs stagger their start by a random delay
-    monkeypatch.setattr(runner.random, "random", lambda: 0.0)
+    monkeypatch.setattr(evaluation.random, "random", lambda: 0.0)
     return exp_dir
 
 
 @pytest.fixture
 def docker(monkeypatch):
     fake = FakeDocker()
-    monkeypatch.setattr(runner, "run_docker_command", fake)
+    monkeypatch.setattr(containers, "run_docker_command", fake)
     return fake
 
 
@@ -210,8 +214,8 @@ def child(agent_id=1, parent_id=0, meta_agent_id=0, **extra):
 
 def create(exp_dir, planned=None):
     planned = planned or child()
-    asyncio.run(runner.run_meta_agent_benchmark(1, exp_dir, planned))
-    return runner.read_lineage(exp_dir / f"agent_{planned['id']}")
+    asyncio.run(creation.run_meta_agent_benchmark(1, exp_dir, planned))
+    return lineage.read_lineage(exp_dir / f"agent_{planned['id']}")
 
 
 # run_meta_agent_benchmark -----------------------------------------------------
@@ -227,7 +231,7 @@ def test_created_agent_is_recorded(experiment, docker):
     # What the meta-improvement step used, as reported by the meta agent
     assert record["usage"] == {"tokens": 1000, "cached_tokens": 500, "cost": 0.25, "time": 12.5}
     assert "failure_reason" not in record
-    assert runner.get_failed_iterations(experiment) == set()
+    assert lineage.get_failed_iterations(experiment) == set()
     # It starts from the parent's code
     assert (experiment / "agent_1/agent_code/description.txt").read_text() == "Agent 0"
     # The logs of how an agent was made are kept with that agent
@@ -269,7 +273,7 @@ def test_meta_agent_runs_in_its_own_image(experiment, docker):
 
 def test_agents_without_an_image_run_in_the_base_image(experiment, monkeypatch):
     docker = FakeDocker(fail={"image"})  # `docker image inspect` finds nothing
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     create(experiment)
 
@@ -287,13 +291,13 @@ def test_agents_without_an_image_run_in_the_base_image(experiment, monkeypatch):
 )
 def test_failures_mark_the_new_agent_failed(experiment, monkeypatch, failing, reason):
     docker = FakeDocker(fail={failing})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     record = create(experiment)
 
     assert record["status"] == "failed"
     assert reason in record["failure_reason"]
-    assert runner.get_failed_iterations(experiment) == {1}
+    assert lineage.get_failed_iterations(experiment) == {1}
     # The container is still cleaned up
     assert docker.calls_to("rm")
 
@@ -302,12 +306,12 @@ def test_exception_marks_failed_and_propagates(experiment, docker, monkeypatch):
     async def exploding_wait(container_name, timeout=30):
         raise TimeoutError("container never became ready")
 
-    monkeypatch.setattr(runner, "wait_for_container_ready", exploding_wait)
+    monkeypatch.setattr(containers, "wait_for_container_ready", exploding_wait)
 
     with pytest.raises(TimeoutError):
         create(experiment)
 
-    record = runner.read_lineage(experiment / "agent_1")
+    record = lineage.read_lineage(experiment / "agent_1")
     assert record["status"] == "failed"
     assert "TimeoutError" in record["failure_reason"]
 
@@ -316,16 +320,16 @@ def test_interruption_leaves_the_agent_pending(experiment, docker, monkeypatch):
     async def interrupted_wait(container_name, timeout=30):
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(runner, "wait_for_container_ready", interrupted_wait)
+    monkeypatch.setattr(containers, "wait_for_container_ready", interrupted_wait)
 
     async def run():
         with pytest.raises(asyncio.CancelledError):
-            await runner.run_meta_agent_benchmark(1, experiment, child())
+            await creation.run_meta_agent_benchmark(1, experiment, child())
 
     asyncio.run(run())
 
     # Not 'failed': it is to be created afresh when the experiment resumes
-    assert runner.read_lineage(experiment / "agent_1")["status"] == "pending"
+    assert lineage.read_lineage(experiment / "agent_1")["status"] == "pending"
     assert docker.calls_to("rm")
 
 
@@ -367,7 +371,7 @@ def test_change_log_is_the_parents_plus_other_branches(scored_experiment, docker
 
 
 def test_plan_defaults_to_one_greedy_child(scored_experiment):
-    plan = runner.plan_generation(scored_experiment, generation=2, n_children=1)
+    plan = creation.plan_generation(scored_experiment, generation=2, n_children=1)
 
     assert plan == [
         {
@@ -392,13 +396,13 @@ def test_plan_defaults_to_one_greedy_child(scored_experiment):
 def test_plan_of_several_children_can_be_replayed(scored_experiment, strategy):
     from search.selection import ArchiveView, get_selector, selection_rng
 
-    plan = runner.plan_generation(
+    plan = creation.plan_generation(
         scored_experiment, generation=5, n_children=4, selection=strategy, seed=99
     )
 
     assert [c["id"] for c in plan] == [3, 4, 5, 6]
     assert [c["selection"]["index"] for c in plan] == [0, 1, 2, 3]
-    view = ArchiveView.from_analyzer(runner.ArchiveAnalyzer(scored_experiment), 2)
+    view = ArchiveView.from_analyzer(ArchiveAnalyzer(scored_experiment), 2)
     for planned in plan:
         record = planned["selection"]
         replayed = get_selector(record["strategy"]).select(
@@ -409,10 +413,10 @@ def test_plan_of_several_children_can_be_replayed(scored_experiment, strategy):
 
 
 def test_plan_never_uses_a_failed_agent(scored_experiment):
-    runner.write_lineage(scored_experiment / "agent_1", status="failed")
+    lineage.write_lineage(scored_experiment / "agent_1", status="failed")
 
     for seed in range(20):
-        plan = runner.plan_generation(
+        plan = creation.plan_generation(
             scored_experiment, 2, 3, selection="score_child_prop", seed=seed
         )
         for planned in plan:
@@ -422,7 +426,7 @@ def test_plan_never_uses_a_failed_agent(scored_experiment):
 
 
 def test_plan_for_an_archive_without_results(experiment):
-    plan = runner.plan_generation(experiment, generation=0, n_children=2)
+    plan = creation.plan_generation(experiment, generation=0, n_children=2)
     assert [(c["id"], c["parent_id"], c["meta_agent_id"]) for c in plan] == [
         (1, 0, 0),
         (2, 0, 0),
@@ -440,9 +444,9 @@ class FakeSteps:
         self.fail, self.raise_for, self.stop_at = set(fail), set(raise_for), stop_at
         self.events: list[tuple] = []
         self.planned: list[dict] = []
-        monkeypatch.setattr(runner, "run_benchmarks_with_job_queue", self.benchmarks)
-        monkeypatch.setattr(runner, "run_meta_agent_benchmark", self.create)
-        monkeypatch.setattr(runner, "run_docker_command", FakeDocker(fail={"image"}))
+        monkeypatch.setattr(evaluation, "run_benchmarks_with_job_queue", self.benchmarks)
+        monkeypatch.setattr(creation, "run_meta_agent_benchmark", self.create)
+        monkeypatch.setattr(containers, "run_docker_command", FakeDocker(fail={"image"}))
 
     async def benchmarks(self, exp_dir, agent_dir, benchmarks, workers, **kwargs):
         self.events.append(("evaluate", int(agent_dir.name.split("_")[1])))
@@ -452,7 +456,7 @@ class FakeSteps:
         agent_id = planned["id"]
         agent_dir = exp_dir / f"agent_{agent_id}"
         if agent_dir.exists():  # the real step sets an interrupted attempt aside
-            assert runner.read_lineage(agent_dir)["status"] == "pending"
+            assert lineage.read_lineage(agent_dir)["status"] == "pending"
             shutil.rmtree(agent_dir)
         if agent_id == self.stop_at:
             self.stop_at = None
@@ -467,7 +471,7 @@ class FakeSteps:
 
 
 def search(exp_dir, iterations, **kwargs):
-    asyncio.run(runner.run_search(1, exp_dir, iterations, workers=2, **kwargs))
+    asyncio.run(loop.run_search(1, exp_dir, iterations, workers=2, **kwargs))
 
 
 def test_one_child_per_generation_is_the_original_loop(experiment, monkeypatch):
@@ -483,7 +487,7 @@ def test_one_child_per_generation_is_the_original_loop(experiment, monkeypatch):
         ("evaluate", 2),
         ("create", 3, 0),
     ]
-    metadata = runner.load_metadata(experiment)
+    metadata = state.load_metadata(experiment)
     assert metadata["generation"] == 3
     assert metadata["pending_agents"] == [3]  # created, but not evaluated yet
     assert metadata["planned_children"] is None
@@ -498,7 +502,7 @@ def test_several_children_per_generation(experiment, monkeypatch):
     assert sorted(steps.events[1:4]) == [("create", 1, 0), ("create", 2, 0), ("create", 3, 0)]
     assert steps.events[4:7] == [("evaluate", 1), ("evaluate", 2), ("evaluate", 3)]
     assert sorted(e[1] for e in steps.events[7:]) == [4, 5, 6]
-    assert runner.load_metadata(experiment)["pending_agents"] == [4, 5, 6]
+    assert state.load_metadata(experiment)["pending_agents"] == [4, 5, 6]
 
 
 def test_failed_children_are_not_evaluated(experiment, monkeypatch):
@@ -518,7 +522,7 @@ def test_one_child_raising_does_not_stop_the_others(experiment, monkeypatch):
 
     search(experiment, iterations=2, n_children=3)
 
-    assert runner.load_metadata(experiment)["generation"] == 2
+    assert state.load_metadata(experiment)["generation"] == 2
     assert ("evaluate", 2) not in steps.events
     assert ("evaluate", 3) in steps.events
 
@@ -529,14 +533,14 @@ def test_search_stops_when_every_child_raises(experiment, monkeypatch):
     with pytest.raises(RuntimeError, match="blew up"):
         search(experiment, iterations=2, n_children=2)
 
-    assert runner.load_metadata(experiment)["generation"] == 0
+    assert state.load_metadata(experiment)["generation"] == 0
 
 
 def test_resuming_finishes_the_planned_generation(experiment, monkeypatch):
     steps = FakeSteps(monkeypatch, experiment, stop_at=2)
     with pytest.raises(KeyboardInterrupt):
         search(experiment, iterations=1, n_children=3, selection="thompson", seed=5)
-    plan = runner.load_metadata(experiment)["planned_children"]
+    plan = state.load_metadata(experiment)["planned_children"]
     steps.events.clear()
 
     search(experiment, iterations=1, n_children=3, selection="thompson", seed=5)
@@ -547,8 +551,8 @@ def test_resuming_finishes_the_planned_generation(experiment, monkeypatch):
         ("create", 2, plan[1]["parent_id"]),
         ("create", 3, plan[2]["parent_id"]),
     ]
-    assert runner.load_metadata(experiment)["planned_children"] is None
-    metadata = runner.load_metadata(experiment)
+    assert state.load_metadata(experiment)["planned_children"] is None
+    metadata = state.load_metadata(experiment)
     assert metadata["generation"] == 1
     assert metadata["pending_agents"] == [1, 2, 3]
 
@@ -561,11 +565,11 @@ def test_two_generations_with_real_agent_creation(experiment, docker, monkeypatc
         agent_id = int(agent_dir.name.split("_")[1])
         add_results(exp_dir, agent_id, scores[agent_id])
 
-    monkeypatch.setattr(runner, "run_benchmarks_with_job_queue", benchmarks)
+    monkeypatch.setattr(evaluation, "run_benchmarks_with_job_queue", benchmarks)
 
     search(experiment, iterations=2, n_children=2, selection="score_child_prop", seed=3)
 
-    lineage = runner.ArchiveAnalyzer(experiment).get_lineage()
+    lineage = ArchiveAnalyzer(experiment).get_lineage()
     assert sorted(lineage) == [0, 1, 2, 3, 4]
     assert all(record["status"] == "ok" for record in lineage.values())
     assert [lineage[i]["parent_id"] for i in (1, 2)] == [0, 0]
@@ -584,7 +588,7 @@ def test_two_generations_with_real_agent_creation(experiment, docker, monkeypatc
     # Each new agent got its own image
     tags = [c[c.index("-t") + 1] for c in docker.calls_to("buildx")]
     assert sorted(tags) == [f"sica_sandbox:run1_agent{i}" for i in (1, 2, 3, 4)]
-    assert runner.load_metadata(experiment)["pending_agents"] == [3, 4]
+    assert state.load_metadata(experiment)["pending_agents"] == [3, 4]
 
 
 def test_legacy_experiment_is_resumed_where_it_was(experiment, monkeypatch):
@@ -606,7 +610,7 @@ def test_legacy_experiment_is_resumed_where_it_was(experiment, monkeypatch):
     # Only the remains of the interrupted step were moved out of the way
     (kept,) = (experiment / "_interrupted").iterdir()
     assert kept.name.startswith("agent_3_")
-    assert runner.read_lineage(experiment / "agent_2")["status"] == "ok"
+    assert lineage.read_lineage(experiment / "agent_2")["status"] == "ok"
 
 
 # resolve_selection_seed -------------------------------------------------------
@@ -614,31 +618,31 @@ def test_legacy_experiment_is_resumed_where_it_was(experiment, monkeypatch):
 
 @pytest.fixture
 def exp_dir(tmp_path):
-    runner.load_metadata(tmp_path)  # creates metadata.json
+    state.load_metadata(tmp_path)  # creates metadata.json
     return tmp_path
 
 
 def test_new_experiment_gets_a_random_seed_that_is_kept(exp_dir):
-    seed = runner.resolve_selection_seed(exp_dir)
+    seed = state.resolve_selection_seed(exp_dir)
 
     assert isinstance(seed, int)
-    assert runner.load_metadata(exp_dir)["selection_seed"] == seed
+    assert state.load_metadata(exp_dir)["selection_seed"] == seed
     # Resuming the experiment keeps it
-    assert runner.resolve_selection_seed(exp_dir) == seed
+    assert state.resolve_selection_seed(exp_dir) == seed
 
 
 def test_explicit_seed_is_used_and_stored(exp_dir):
-    assert runner.resolve_selection_seed(exp_dir, 42) == 42
-    assert runner.load_metadata(exp_dir)["selection_seed"] == 42
-    assert runner.resolve_selection_seed(exp_dir) == 42
+    assert state.resolve_selection_seed(exp_dir, 42) == 42
+    assert state.load_metadata(exp_dir)["selection_seed"] == 42
+    assert state.resolve_selection_seed(exp_dir) == 42
     # Seed 0 is a seed like any other
-    assert runner.resolve_selection_seed(exp_dir, 0) == 0
-    assert runner.resolve_selection_seed(exp_dir) == 0
+    assert state.resolve_selection_seed(exp_dir, 0) == 0
+    assert state.resolve_selection_seed(exp_dir) == 0
 
 
 def settings_for(*argv):
     """The settings that the runner would use for a command line"""
-    return runner.settings_from_args(runner.setup_argparse().parse_args(list(argv)))
+    return cli.settings_from_args(cli.setup_argparse().parse_args(list(argv)))
 
 
 def test_selection_cli_arguments():
@@ -684,7 +688,7 @@ class FakeBenchmark(BaseBenchmark):
 
 @pytest.fixture
 def fake_benchmark(monkeypatch):
-    monkeypatch.setattr(runner, "benchmark_registry", {"fake": FakeBenchmark})
+    monkeypatch.setattr(evaluation, "benchmark_registry", {"fake": FakeBenchmark})
     monkeypatch.setattr(FakeBenchmark, "created_with", [])
     return FakeBenchmark
 
@@ -697,7 +701,7 @@ def read_results(agent_results_dir):
 def run_queue(exp_dir, agent_id=0, **kwargs):
     kwargs.setdefault("subset_size", 0)  # all of the fake problems
     asyncio.run(
-        runner.run_benchmarks_with_job_queue(
+        evaluation.run_benchmarks_with_job_queue(
             exp_dir, exp_dir / f"agent_{agent_id}", [FakeBenchmark], 3, **kwargs
         )
     )
@@ -719,7 +723,7 @@ def test_each_problem_is_run_repeatedly(experiment, docker):
     traces = experiment / "agent_0" / "benchmarks" / "fake" / "traces"
     assert (traces / "p0" / "summary.txt").exists()
     assert (traces / "p0#2" / "summary.txt").exists()
-    progress = runner.load_metadata(experiment)["benchmark_progress"]["fake"]
+    progress = state.load_metadata(experiment)["benchmark_progress"]["fake"]
     assert (progress["total"], progress["completed"]) == (30, 30)
 
 
@@ -762,14 +766,14 @@ def test_statistics_count_each_problem_once(tmp_path):
     ]
     (bench_dir / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
 
-    asyncio.run(runner.generate_benchmark_statistics(tmp_path / "agent_0", "fake"))
+    asyncio.run(evaluation.generate_benchmark_statistics(tmp_path / "agent_0", "fake"))
 
     perf = json.loads((bench_dir / "perf.json").read_text())
     assert perf["avg_score"] == 0.5  # not 3/4
 
 
 def test_holdout_results_stay_out_of_the_archive(experiment, docker):
-    holdout = runner.holdout_dir(experiment)
+    holdout = holdout_dir(experiment)
 
     run_queue(experiment, results_exp_dir=holdout, select_problems=lambda b: b.problems[:2])
 
@@ -781,12 +785,12 @@ def test_holdout_results_stay_out_of_the_archive(experiment, docker):
     # what agents get to see as their archive
     assert not (experiment / "agent_0" / "benchmarks").exists()
     assert not (experiment / "problem_data").exists()
-    assert "benchmark_progress" not in runner.load_metadata(experiment)
+    assert "benchmark_progress" not in state.load_metadata(experiment)
     # The container can write to the holdout directory
     run_cmd = docker.calls_to("run")[0]
     assert any(arg.startswith(f"{holdout}:") and arg.endswith(":rw") for arg in run_cmd)
     # And the holdout results can be analysed like an archive
-    analyzer = runner.ArchiveAnalyzer(holdout)
+    analyzer = ArchiveAnalyzer(holdout)
     assert analyzer.analyze_run().loc[0, "fake_score"] == 1.0
 
 
@@ -798,8 +802,8 @@ class FakeQueue:
         self.scores_by_agent = scores_by_agent
         self.calls: list[dict] = []
         self.settings: list[dict] = []  # the other settings of each call
-        monkeypatch.setattr(runner, "run_benchmarks_with_job_queue", self)
-        monkeypatch.setattr(runner, "run_docker_command", FakeDocker(fail={"image"}))
+        monkeypatch.setattr(evaluation, "run_benchmarks_with_job_queue", self)
+        monkeypatch.setattr(containers, "run_docker_command", FakeDocker(fail={"image"}))
 
     async def __call__(
         self, exp_dir, agent_dir, benchmarks, workers,
@@ -842,7 +846,7 @@ class FakeQueue:
 
 
 def evaluate(exp_dir, agent_id, config):
-    asyncio.run(runner.evaluate_agent(1, exp_dir, agent_id, 2, config))
+    asyncio.run(evaluation.evaluate_agent(1, exp_dir, agent_id, 2, config))
 
 
 def fake_problem_ids(problem_list):
@@ -862,7 +866,7 @@ def test_default_evaluation_is_one_full_run(experiment, fake_benchmark, monkeypa
             "repeats": 1,
         }
     ]
-    assert "evaluation" not in runner.read_lineage(experiment / "agent_0")
+    assert "evaluation" not in lineage.read_lineage(experiment / "agent_0")
 
 
 def test_holdout_problems_are_run_separately(experiment, fake_benchmark, monkeypatch):
@@ -915,12 +919,12 @@ def test_good_agent_is_promoted_to_the_full_evaluation(parent_and_children):
         {"agent": 1, "holdout": False, "problems": fake_problem_ids(dev), "repeats": 1},
         {"agent": 1, "holdout": True, "problems": fake_problem_ids(holdout), "repeats": 1},
     ]
-    evaluation = runner.read_lineage(experiment / "agent_1")["evaluation"]
+    evaluation = lineage.read_lineage(experiment / "agent_1")["evaluation"]
     assert evaluation["promoted"] is True
     assert evaluation["stage1_delta"] == {
         "mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "n_problems": 4,
     }
-    assert runner.get_pruned_iterations(experiment) == set()
+    assert lineage.get_pruned_iterations(experiment) == set()
 
 
 def test_clearly_worse_agent_is_dropped_after_the_first_stage(parent_and_children):
@@ -930,11 +934,11 @@ def test_clearly_worse_agent_is_dropped_after_the_first_stage(parent_and_childre
 
     # Four problems instead of ten, and no held-out problems at all
     assert [(c["holdout"], len(c["problems"])) for c in queue.calls] == [(False, 4)]
-    evaluation = runner.read_lineage(experiment / "agent_2")["evaluation"]
+    evaluation = lineage.read_lineage(experiment / "agent_2")["evaluation"]
     assert evaluation["promoted"] is False
     assert evaluation["stage1_delta"]["mean"] == -1.0
-    assert runner.get_pruned_iterations(experiment) == {2}
-    assert not (runner.holdout_dir(experiment) / "agent_2").exists()
+    assert lineage.get_pruned_iterations(experiment) == {2}
+    assert not (holdout_dir(experiment) / "agent_2").exists()
 
 
 def test_dropped_agent_is_not_built_upon(parent_and_children):
@@ -943,7 +947,7 @@ def test_dropped_agent_is_not_built_upon(parent_and_children):
     evaluate(experiment, 2, config)
 
     for seed in range(20):
-        plan = runner.plan_generation(experiment, 1, 3, selection="thompson", seed=seed)
+        plan = creation.plan_generation(experiment, 1, 3, selection="thompson", seed=seed)
         assert all(c["parent_id"] in (0, 1) for c in plan)
         assert all("2" not in c["selection"]["weights"] for c in plan)
 
@@ -970,7 +974,7 @@ def test_threshold_controls_how_readily_agents_are_dropped(parent_and_children):
 
     evaluate(experiment, 2, lenient)
 
-    assert runner.read_lineage(experiment / "agent_2")["evaluation"]["promoted"] is True
+    assert lineage.read_lineage(experiment / "agent_2")["evaluation"]["promoted"] is True
     assert len(queue.calls) == 3
 
 
@@ -978,36 +982,36 @@ def test_search_passes_the_evaluation_config_on(experiment, fake_benchmark, monk
     queue = FakeQueue(monkeypatch, {0: 1.0})
 
     asyncio.run(
-        runner.run_search(
+        loop.run_search(
             1, experiment, 0, 2, config=fake_config(repeats=3)
         )
     )
     assert queue.calls == []  # no generations to run
 
     asyncio.run(
-        runner.evaluate_pending_agents(1, experiment, 2, fake_config(repeats=3))
+        evaluation.evaluate_pending_agents(1, experiment, 2, fake_config(repeats=3))
     )
     assert [c["repeats"] for c in queue.calls] == [3]
-    assert runner.load_metadata(experiment)["pending_agents"] == []
+    assert state.load_metadata(experiment)["pending_agents"] == []
 
 
 # resolve_evaluation_config ----------------------------------------------------
 
 
 def test_evaluation_config_defaults_and_is_stored(exp_dir):
-    config = runner.resolve_evaluation_config(exp_dir, seed=11)
+    config = state.resolve_evaluation_config(exp_dir, seed=11)
 
     assert config == EvaluationConfig(split_seed=11)
-    assert runner.load_metadata(exp_dir)["evaluation"] == config.to_dict()
+    assert state.load_metadata(exp_dir)["evaluation"] == config.to_dict()
 
 
 def test_evaluation_config_is_kept_when_resuming(exp_dir):
-    runner.resolve_evaluation_config(
+    state.resolve_evaluation_config(
         exp_dir, seed=11, repeats=3, holdout_fraction=0.25, stage1_size=6
     )
 
     # Resumed without options, and with another selection seed
-    config = runner.resolve_evaluation_config(exp_dir, seed=99)
+    config = state.resolve_evaluation_config(exp_dir, seed=99)
 
     assert config == EvaluationConfig(
         repeats=3, holdout_fraction=0.25, stage1_size=6, split_seed=11
@@ -1015,38 +1019,38 @@ def test_evaluation_config_is_kept_when_resuming(exp_dir):
 
 
 def test_evaluation_settings_other_than_the_split_can_change(exp_dir):
-    runner.resolve_evaluation_config(exp_dir, seed=11, repeats=1)
+    state.resolve_evaluation_config(exp_dir, seed=11, repeats=1)
     (exp_dir / "agent_0" / "benchmarks").mkdir(parents=True)
 
-    config = runner.resolve_evaluation_config(
+    config = state.resolve_evaluation_config(
         exp_dir, seed=11, repeats=4, stage1_size=5, promote_threshold=-0.2
     )
 
     assert (config.repeats, config.stage1_size, config.promote_threshold) == (4, 5, -0.2)
-    assert runner.load_metadata(exp_dir)["evaluation"]["repeats"] == 4
+    assert state.load_metadata(exp_dir)["evaluation"]["repeats"] == 4
 
 
 def test_holdout_split_cannot_change_once_agents_are_evaluated(exp_dir):
-    runner.resolve_evaluation_config(exp_dir, seed=11, holdout_fraction=0.25)
-    assert runner.resolve_evaluation_config(exp_dir, 11, holdout_fraction=0.5).holdout_fraction == 0.5
+    state.resolve_evaluation_config(exp_dir, seed=11, holdout_fraction=0.25)
+    assert state.resolve_evaluation_config(exp_dir, 11, holdout_fraction=0.5).holdout_fraction == 0.5
     (exp_dir / "agent_0" / "benchmarks").mkdir(parents=True)
 
     with pytest.raises(ValueError, match="cannot be changed"):
-        runner.resolve_evaluation_config(exp_dir, seed=11, holdout_fraction=0.25)
+        state.resolve_evaluation_config(exp_dir, seed=11, holdout_fraction=0.25)
     # Nor can one be introduced in an experiment that was started without
-    assert runner.resolve_evaluation_config(exp_dir, seed=11).holdout_fraction == 0.5
+    assert state.resolve_evaluation_config(exp_dir, seed=11).holdout_fraction == 0.5
 
 
 def test_legacy_experiment_cannot_get_a_holdout_split(exp_dir):
     (exp_dir / "agent_0" / "benchmarks").mkdir(parents=True)
     with pytest.raises(ValueError, match="cannot be changed"):
-        runner.resolve_evaluation_config(exp_dir, seed=11, holdout_fraction=0.3)
-    assert runner.resolve_evaluation_config(exp_dir, seed=11, repeats=2).repeats == 2
+        state.resolve_evaluation_config(exp_dir, seed=11, holdout_fraction=0.3)
+    assert state.resolve_evaluation_config(exp_dir, seed=11, repeats=2).repeats == 2
 
 
 def test_invalid_evaluation_settings_are_rejected(exp_dir):
     with pytest.raises(ValueError):
-        runner.resolve_evaluation_config(exp_dir, seed=11, repeats=0)
+        state.resolve_evaluation_config(exp_dir, seed=11, repeats=0)
 
 
 def test_evaluation_cli_arguments():
@@ -1071,7 +1075,7 @@ def test_evaluation_cli_arguments():
 
 
 def meta_agents(exp_dir, **kwargs):
-    plan = runner.plan_generation(
+    plan = creation.plan_generation(
         exp_dir, generation=2, n_children=6, selection="score_child_prop", seed=4, **kwargs
     )
     return [(c["parent_id"], c["meta_agent_id"]) for c in plan]
@@ -1099,18 +1103,18 @@ def test_meta_agent_can_be_a_fixed_agent(scored_experiment):
 
 def test_fixed_meta_agent_has_to_be_usable(scored_experiment):
     with pytest.raises(ValueError, match="does not exist"):
-        runner.plan_generation(scored_experiment, 2, 1, meta_agent=9)
+        creation.plan_generation(scored_experiment, 2, 1, meta_agent=9)
 
-    runner.write_lineage(scored_experiment / "agent_2", status="failed")
+    lineage.write_lineage(scored_experiment / "agent_2", status="failed")
     with pytest.raises(ValueError, match="not created successfully"):
-        runner.plan_generation(scored_experiment, 2, 1, meta_agent=2)
+        creation.plan_generation(scored_experiment, 2, 1, meta_agent=2)
 
     with pytest.raises(ValueError, match="Unknown meta agent"):
-        runner.plan_generation(scored_experiment, 2, 1, meta_agent="strongest")
+        creation.plan_generation(scored_experiment, 2, 1, meta_agent="strongest")
 
 
 def test_meta_model_is_planned_and_recorded(scored_experiment, docker):
-    (planned,) = runner.plan_generation(
+    (planned,) = creation.plan_generation(
         scored_experiment, 2, 1, meta_agent="seed", meta_model="GPT4O"
     )
     assert planned["meta_model"] == "GPT4O"
@@ -1142,7 +1146,7 @@ def test_search_plans_with_the_given_meta_agent_and_model(experiment, monkeypatc
     steps = FakeSteps(monkeypatch, experiment)
 
     asyncio.run(
-        runner.run_search(
+        loop.run_search(
             1, experiment, 1, 2, n_children=2, meta_agent="parent", meta_model="GPT4O"
         )
     )
@@ -1197,9 +1201,9 @@ def test_new_agent_is_validated_in_its_own_image(experiment, docker):
     ],
 )
 def test_agent_that_cannot_run_is_marked_invalid(experiment, monkeypatch, broken, check):
-    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    lineage.write_lineage(experiment / "agent_0", tests_passed=True)
     docker = FakeDocker(fail_commands={broken: None})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     record = create(experiment)
 
@@ -1209,15 +1213,15 @@ def test_agent_that_cannot_run_is_marked_invalid(experiment, monkeypatch, broken
     assert record["gate"]["checks"][-1]["name"] == check
     assert "went wrong" in record["gate"]["checks"][-1]["output"]
     # It is not evaluated, and never built upon
-    assert runner.get_failed_iterations(experiment) == {1}
+    assert lineage.get_failed_iterations(experiment) == {1}
     # What it cost to make is still accounted for
     assert record["usage"]["cost"] == 0.25
 
 
 def test_invalid_agent_is_final(experiment, monkeypatch):
-    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    lineage.write_lineage(experiment / "agent_0", tests_passed=True)
     docker = FakeDocker(fail_commands={"import agent_code.agent": None})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
     create(experiment)
 
     with pytest.raises(ValueError, match="already been created"):
@@ -1225,9 +1229,9 @@ def test_invalid_agent_is_final(experiment, monkeypatch):
 
 
 def test_failing_tests_inherited_from_the_parent_do_not_invalidate(experiment, monkeypatch):
-    runner.write_lineage(experiment / "agent_0", tests_passed=False)
+    lineage.write_lineage(experiment / "agent_0", tests_passed=False)
     docker = FakeDocker(fail_commands={"&& pytest": None})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     record = create(experiment)
 
@@ -1241,9 +1245,9 @@ def test_failing_tests_inherited_from_the_parent_do_not_invalidate(experiment, m
 
 def test_parents_tests_are_run_when_their_result_is_unknown(experiment, monkeypatch):
     # e.g. a parent from before the gate existed
-    assert "tests_passed" not in runner.read_lineage(experiment / "agent_0")
+    assert "tests_passed" not in lineage.read_lineage(experiment / "agent_0")
     docker = FakeDocker(fail_commands={"&& pytest": None})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     record = create(experiment)
 
@@ -1252,13 +1256,13 @@ def test_parents_tests_are_run_when_their_result_is_unknown(experiment, monkeypa
     assert f"{experiment / 'agent_0' / 'agent_code'}:/mnt/agent_code:ro" in parent_run
     assert "sica_sandbox:run1_agent0" in parent_run  # in the parent's own image
     # Recorded, so that it is not run again for the next child
-    assert runner.read_lineage(experiment / "agent_0")["tests_passed"] is False
+    assert lineage.read_lineage(experiment / "agent_0")["tests_passed"] is False
 
 
 def test_meta_agent_gets_to_fix_an_agent_that_fails_the_gate(experiment, monkeypatch):
-    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    lineage.write_lineage(experiment / "agent_0", tests_passed=True)
     docker = FakeDocker(fail_commands={"&& pytest": 1})  # fails once, then passes
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     record = create_with_gate(experiment, GateConfig(retries=2))
 
@@ -1275,9 +1279,9 @@ def test_meta_agent_gets_to_fix_an_agent_that_fails_the_gate(experiment, monkeyp
 
 
 def test_fix_attempts_are_limited(experiment, monkeypatch):
-    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    lineage.write_lineage(experiment / "agent_0", tests_passed=True)
     docker = FakeDocker(fail_commands={"&& pytest": None})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     record = create_with_gate(experiment, GateConfig(retries=2))
 
@@ -1288,9 +1292,9 @@ def test_fix_attempts_are_limited(experiment, monkeypatch):
 
 
 def test_fix_uses_the_meta_model(experiment, monkeypatch):
-    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    lineage.write_lineage(experiment / "agent_0", tests_passed=True)
     docker = FakeDocker(fail_commands={"&& pytest": 1})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     create_with_gate(experiment, GateConfig(retries=1), child(meta_model="GPT4O"))
 
@@ -1308,13 +1312,13 @@ def test_gate_can_be_switched_off(experiment, docker):
 
 def test_gate_container_failure_marks_the_agent_failed(experiment, monkeypatch):
     docker = FakeDocker(fail_commands={"cp -r /mnt/agent_code": None})
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
 
     with pytest.raises(RuntimeError, match="Could not copy the agent code"):
         create(experiment)
 
     # Not 'invalid': the agent was never actually checked
-    assert runner.read_lineage(experiment / "agent_1")["status"] == "failed"
+    assert lineage.read_lineage(experiment / "agent_1")["status"] == "failed"
     assert len(docker.calls_to("rm")) == 2
 
 
@@ -1327,8 +1331,8 @@ def test_gate_command_timeout_is_a_failure(experiment, docker, monkeypatch):
                 return True, '"running"', ""
             return True, "", ""
 
-        monkeypatch.setattr(runner, "run_docker_command", slow)
-        async with runner.gate_container(1, 0, "image", experiment / "agent_0" / "agent_code") as exec:
+        monkeypatch.setattr(containers, "run_docker_command", slow)
+        async with creation.gate_container(1, 0, "image", experiment / "agent_0" / "agent_code") as exec:
             return await exec("sleepy", timeout=0.05)
 
     assert asyncio.run(run()) == (False, "", "Timed out after 0.05 seconds")
@@ -1336,16 +1340,16 @@ def test_gate_command_timeout_is_a_failure(experiment, docker, monkeypatch):
 
 def create_with_gate(exp_dir, gate, planned=None):
     planned = planned or child()
-    asyncio.run(runner.run_meta_agent_benchmark(1, exp_dir, planned, gate))
-    return runner.read_lineage(exp_dir / f"agent_{planned['id']}")
+    asyncio.run(creation.run_meta_agent_benchmark(1, exp_dir, planned, gate))
+    return lineage.read_lineage(exp_dir / f"agent_{planned['id']}")
 
 
 # The initial agent
 
 
 def check_initial(exp_dir, gate=GateConfig()):
-    asyncio.run(runner.check_initial_agent(1, exp_dir, gate))
-    return runner.read_lineage(exp_dir / "agent_0")
+    asyncio.run(creation.check_initial_agent(1, exp_dir, gate))
+    return lineage.read_lineage(exp_dir / "agent_0")
 
 
 def test_initial_agent_is_checked_once(experiment, docker):
@@ -1364,19 +1368,19 @@ def test_initial_agent_is_checked_once(experiment, docker):
 def test_search_does_not_start_with_a_broken_setup(experiment, monkeypatch, broken):
     steps = FakeSteps(monkeypatch, experiment)
     monkeypatch.setattr(
-        runner, "run_docker_command", FakeDocker(fail_commands={broken: None})
+        containers, "run_docker_command", FakeDocker(fail_commands={broken: None})
     )
 
     with pytest.raises(RuntimeError, match="initial agent does not pass the validation gate"):
         search(experiment, iterations=2)
 
     assert steps.events == []  # nothing was spent
-    assert "gate" not in runner.read_lineage(experiment / "agent_0")
+    assert "gate" not in lineage.read_lineage(experiment / "agent_0")
 
 
 def test_failing_tests_of_the_initial_agent_set_the_standard(experiment, monkeypatch):
     monkeypatch.setattr(
-        runner, "run_docker_command", FakeDocker(fail_commands={"&& pytest": None})
+        containers, "run_docker_command", FakeDocker(fail_commands={"&& pytest": None})
     )
 
     record = check_initial(experiment)
@@ -1398,13 +1402,13 @@ def test_search_passes_the_gate_config_on(experiment, monkeypatch):
         seen.append(gate)
         await steps.create(exp_id, exp_dir, planned)
 
-    monkeypatch.setattr(runner, "run_meta_agent_benchmark", create_recording)
+    monkeypatch.setattr(creation, "run_meta_agent_benchmark", create_recording)
     gate = GateConfig(checks=("import",), retries=3)
 
-    asyncio.run(runner.run_search(1, experiment, 1, 2, gate=gate))
+    asyncio.run(loop.run_search(1, experiment, 1, 2, gate=gate))
 
     assert seen == [gate]
-    assert runner.read_lineage(experiment / "agent_0")["gate"]["checks"] == [
+    assert lineage.read_lineage(experiment / "agent_0")["gate"]["checks"] == [
         {"name": "import", "passed": True, "command": "python -c 'import agent_code.agent'"}
     ]
 
@@ -1416,13 +1420,13 @@ def test_invalid_agents_are_not_evaluated(experiment, monkeypatch):
         status = "invalid" if planned["id"] == 2 else "ok"
         make_agent(exp_dir, planned["id"], planned["parent_id"], status=status)
 
-    monkeypatch.setattr(runner, "run_meta_agent_benchmark", create)
+    monkeypatch.setattr(creation, "run_meta_agent_benchmark", create)
 
     search(experiment, iterations=2, n_children=2)
 
     assert [e for e in steps.events if e[0] == "evaluate"] == [("evaluate", 0), ("evaluate", 1)]
     # And on resumption it counts as created: it is not made again
-    assert runner.load_metadata(experiment)["generation"] == 2
+    assert state.load_metadata(experiment)["generation"] == 2
 
 
 def test_gate_cli_arguments():
@@ -1438,13 +1442,13 @@ def test_gate_cli_arguments():
 
 # Credentials ------------------------------------------------------------------
 
-REPO_ROOT = Path(runner.__file__).parent
+REPO_ROOT = Path(__file__).parent.parent
 SECRET = "sk-test-secret-value"
 
 
 @pytest.fixture
 def api_keys(monkeypatch):
-    for name in runner.SANDBOX_ENV_VARS:
+    for name in containers.SANDBOX_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
     monkeypatch.setenv("VERTEX_REGION", "europe-west1")
@@ -1452,7 +1456,7 @@ def api_keys(monkeypatch):
 
 
 def test_secrets_are_passed_by_name_only(experiment, api_keys):
-    args = runner.sandbox_secret_args()
+    args = containers.sandbox_secret_args()
 
     assert args == ["-e", "ANTHROPIC_API_KEY", "-e", "VERTEX_REGION"]
     assert SECRET not in " ".join(args)
@@ -1463,7 +1467,7 @@ def test_google_credentials_are_mounted_read_only(experiment, api_keys):
     credentials.parent.mkdir()
     credentials.write_text("{}")
 
-    args = runner.sandbox_secret_args()
+    args = containers.sandbox_secret_args()
 
     assert args[-4:] == [
         "-v",
@@ -1523,7 +1527,7 @@ REPORT = {"tokens": 4200, "cached_tokens": 100, "cost": 0.5, "time": 30.0}
 
 def use_docker(monkeypatch, **kwargs):
     docker = FakeDocker(**kwargs)
-    monkeypatch.setattr(runner, "run_docker_command", docker)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
     return docker
 
 
@@ -1576,7 +1580,7 @@ def test_meta_improvement_usage_comes_from_the_report(experiment, monkeypatch):
 
 
 def test_cost_of_fixing_an_agent_is_added_to_its_usage(experiment, monkeypatch):
-    runner.write_lineage(experiment / "agent_0", tests_passed=True)
+    lineage.write_lineage(experiment / "agent_0", tests_passed=True)
     use_docker(monkeypatch, usage_report=REPORT, fail_commands={"&& pytest": 1})
 
     record = create_with_gate(experiment, GateConfig(retries=1))
@@ -1596,7 +1600,7 @@ def test_failed_run_keeps_its_reason_and_is_retried(experiment, monkeypatch):
 
     assert result["score"] is None
     assert "benchmark  went wrong" in result["error"]
-    assert "benchmark_progress" not in runner.load_metadata(experiment)
+    assert "benchmark_progress" not in state.load_metadata(experiment)
 
     # Resuming the experiment attempts it again
     use_docker(monkeypatch)
@@ -1639,28 +1643,28 @@ def test_successful_results_have_no_error(experiment, docker):
 
 
 def test_metadata_updates_leave_no_temporary_files(exp_dir):
-    runner.update_metadata(exp_dir, generation=3)
-    asyncio.run(runner.update_benchmark_progress(exp_dir, "fake", "p0", 10))
+    state.update_metadata(exp_dir, generation=3)
+    asyncio.run(state.update_benchmark_progress(exp_dir, "fake", "p0", 10))
 
     assert sorted(p.name for p in exp_dir.iterdir()) == ["metadata.json"]
-    metadata = runner.load_metadata(exp_dir)
+    metadata = state.load_metadata(exp_dir)
     assert metadata["generation"] == 3
     assert metadata["benchmark_progress"]["fake"]["problems_completed"] == ["p0"]
 
 
 def test_interrupted_metadata_write_keeps_the_previous_version(exp_dir, monkeypatch):
-    runner.update_metadata(exp_dir, generation=3)
+    state.update_metadata(exp_dir, generation=3)
 
     def dump_then_die(data, f, **kwargs):
         f.write('{"generation": 4, "pending_ag')
         raise OSError("disk full")
 
-    monkeypatch.setattr(runner.json, "dump", dump_then_die)
+    monkeypatch.setattr(state.json, "dump", dump_then_die)
     with pytest.raises(OSError):
-        runner.update_metadata(exp_dir, generation=4)
+        state.update_metadata(exp_dir, generation=4)
     monkeypatch.undo()
 
-    assert runner.load_metadata(exp_dir)["generation"] == 3
+    assert state.load_metadata(exp_dir)["generation"] == 3
     assert sorted(p.name for p in exp_dir.iterdir()) == ["metadata.json"]
 
 
@@ -1682,9 +1686,9 @@ def test_settings_come_from_file_and_command_line(tmp_path):
 
 
 def test_every_setting_has_a_command_line_option():
-    parser = runner.setup_argparse()
+    parser = cli.setup_argparse()
     options = {action.dest for action in parser._actions}
-    for name in runner.RunnerSettings.model_fields:
+    for name in RunnerSettings.model_fields:
         assert name in options, name
 
 
@@ -1728,14 +1732,14 @@ def test_benchmarks_are_chosen_by_name(experiment, monkeypatch):
     class Other(FakeBenchmark):
         name = "other"
 
-    monkeypatch.setattr(runner, "benchmark_registry", {"fake": FakeBenchmark, "other": Other})
+    monkeypatch.setattr(evaluation, "benchmark_registry", {"fake": FakeBenchmark, "other": Other})
     seen = []
 
     async def queue(exp_dir, agent_dir, benchmarks, workers, **kwargs):
         seen.append([b.name for b in benchmarks])
 
-    monkeypatch.setattr(runner, "run_benchmarks_with_job_queue", queue)
-    monkeypatch.setattr(runner, "run_docker_command", FakeDocker(fail={"image"}))
+    monkeypatch.setattr(evaluation, "run_benchmarks_with_job_queue", queue)
+    monkeypatch.setattr(containers, "run_docker_command", FakeDocker(fail={"image"}))
 
     evaluate(experiment, 0, EvaluationConfig(benchmarks=("other", "fake")))
     assert seen == [["other", "fake"]]
@@ -1746,47 +1750,47 @@ def test_benchmarks_are_chosen_by_name(experiment, monkeypatch):
 
 def test_unknown_benchmark_is_rejected_with_the_available_ones(exp_dir):
     with pytest.raises(ValueError, match="Unknown benchmark.*nope.*available:.*gsm8k"):
-        runner.resolve_evaluation_config(exp_dir, seed=1, benchmarks=["gsm8k", "nope"])
+        state.resolve_evaluation_config(exp_dir, seed=1, benchmarks=["gsm8k", "nope"])
 
 
 def test_new_evaluation_settings_are_stored(exp_dir):
-    config = runner.resolve_evaluation_config(
+    config = state.resolve_evaluation_config(
         exp_dir, seed=1, benchmarks=["humaneval", "gsm8k"], subset_size=0, timeout_s=900
     )
 
     assert config.benchmarks == ("humaneval", "gsm8k")
-    stored = runner.load_metadata(exp_dir)["evaluation"]
+    stored = state.load_metadata(exp_dir)["evaluation"]
     assert stored["benchmarks"] == ["humaneval", "gsm8k"]
     assert (stored["subset_size"], stored["timeout_s"], stored["cost_limit_usd"]) == (0, 900, 3.0)
     # Kept when the experiment is resumed without options
-    assert runner.resolve_evaluation_config(exp_dir, seed=1) == config
+    assert state.resolve_evaluation_config(exp_dir, seed=1) == config
 
 
 def test_experiments_from_before_these_settings_get_the_old_constants(exp_dir):
-    runner.update_metadata(
+    state.update_metadata(
         exp_dir,
         evaluation={"repeats": 2, "holdout_fraction": 0.0, "stage1_size": 0,
                     "promote_threshold": 0.0, "split_seed": 3},
     )
-    config = runner.resolve_evaluation_config(exp_dir, seed=1)
+    config = state.resolve_evaluation_config(exp_dir, seed=1)
     assert (config.repeats, config.split_seed) == (2, 3)
     assert (config.subset_size, config.benchmark_seed, config.timeout_s) == (18, 1, 600)
 
 
 @pytest.mark.parametrize("setting, value", [("subset_size", 30), ("benchmark_seed", 2)])
 def test_choice_of_problems_cannot_change_once_agents_are_evaluated(exp_dir, setting, value):
-    runner.resolve_evaluation_config(exp_dir, seed=1)
+    state.resolve_evaluation_config(exp_dir, seed=1)
     (exp_dir / "agent_0" / "benchmarks").mkdir(parents=True)
 
     with pytest.raises(ValueError, match=f"{setting} of this experiment .* cannot be changed"):
-        runner.resolve_evaluation_config(exp_dir, seed=1, **{setting: value})
+        state.resolve_evaluation_config(exp_dir, seed=1, **{setting: value})
 
 
 def test_limits_and_benchmarks_can_change_later(exp_dir, caplog):
-    runner.resolve_evaluation_config(exp_dir, seed=1)
+    state.resolve_evaluation_config(exp_dir, seed=1)
     (exp_dir / "agent_0" / "benchmarks").mkdir(parents=True)
 
-    config = runner.resolve_evaluation_config(
+    config = state.resolve_evaluation_config(
         exp_dir, seed=1, timeout_s=300, cost_limit_usd=1.0, benchmarks=["gsm8k", "humaneval"]
     )
 
@@ -1807,8 +1811,8 @@ def test_run_that_exceeds_its_time_limit_is_scored_and_final(experiment, monkeyp
             return await super().__call__(*args)
 
     docker = StuckDocker()
-    monkeypatch.setattr(runner, "run_docker_command", docker)
-    monkeypatch.setattr(runner, "TIMEOUT_GRACE_SECONDS", 0)
+    monkeypatch.setattr(containers, "run_docker_command", docker)
+    monkeypatch.setattr(evaluation, "TIMEOUT_GRACE_SECONDS", 0)
 
     async def no_answer(self, problem, agent_workdir, agent_answer_dir, container_name):
         return 0.0, None, None
@@ -1827,3 +1831,14 @@ def test_run_that_exceeds_its_time_limit_is_scored_and_final(experiment, monkeyp
     n_runs = len(docker.commands_containing(" benchmark "))
     run_queue(experiment, select_problems=lambda b: b.problems[:1], timeout_s=0.05)
     assert len(docker.commands_containing(" benchmark ")) == n_runs
+
+
+# The entry point ----------------------------------------------------------------
+
+
+def test_runner_script_is_the_entry_point():
+    import runner
+
+    assert runner.main is cli.main
+    source = (REPO_ROOT / "runner.py").read_text()
+    assert 'if __name__ == "__main__":' in source and "asyncio.run(main())" in source

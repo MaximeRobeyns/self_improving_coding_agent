@@ -81,7 +81,7 @@ class ToolInterface(BaseModel, ABC):
 
     @classmethod
     @abstractmethod
-    def generate_examples(cls) -> list[tuple["BaseTool", ToolResult]]:
+    def generate_examples(cls) -> list[tuple["BaseTool", ToolResult]]:  # noqa: F821
         """Generate example uses of the tool with their expected outputs"""
         pass
 

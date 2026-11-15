@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: base_agent/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r base_agent/requirements.txt ruff
+
+      # Errors only (syntax errors, undefined names): see ruff.toml
+      - name: Lint
+        run: ruff check .
+
+      # Neither suite calls a model or starts a container
+      - name: Agent tests
+        run: pytest base_agent
+
+      - name: Runner tests
+        run: pytest tests

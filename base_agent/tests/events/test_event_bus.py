@@ -10,6 +10,7 @@ These tests verify the core functionality of the EventBus class, which serves
 as the centralized event management system for the agent framework.
 """
 import pytest
+import pytest_asyncio
 import asyncio
 import json
 import tempfile
@@ -24,7 +25,7 @@ from src.types.event_types import EventType, Event, FileEvent, FileOperation
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def reset_event_bus():
     """Reset the EventBus singleton between tests."""
     # Reset the singleton instance to ensure tests are isolated

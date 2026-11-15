@@ -1,0 +1,6 @@
+exclude = ["env100", "results", "benchmark_data"]
+
+[lint]
+# Only what is certainly a bug: syntax errors, undefined names, and comparisons
+# or statements that cannot do what they say. Style is not checked.
+select = ["E9", "F63", "F7", "F82"]

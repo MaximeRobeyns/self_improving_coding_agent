@@ -60,8 +60,8 @@ Finally, install the requirements in your local python environment:
 ```bash
 # remember to activate a virtual environment or equivalent here
 pip install -r base_agent/requirements.txt
-pip install swebench
 ```
+The `swebench` benchmark additionally needs the SWE-bench harness installed from source (`scripts/install_swebench_harness.sh`); nothing else does.
 
 ### Testing the Agent
 
@@ -88,7 +88,15 @@ or agent arguments wit
 python -m base_agent.agent --help
 ```
 
-To further configure the agent, including the choice of LLMs, edit `base_agent/src/config.py`.
+To further configure the agent, including the choice of LLMs, edit `base_agent/src/config.py`, or set `AGENT_MODEL`, `AGENT_REASONING_MODEL` and `AGENT_OVERSIGHT_MODEL` to the name of a model in `base_agent/src/types/llm_types.py`. The default model is Claude Sonnet 5.5 (`SONNET_55`); `OPUS_55` and `HAIKU_55` are defined as well. The Claude 3.x models that the agent was originally written for have been retired from the Claude API.
+
+### Tests
+
+```bash
+make test    # the agent's tests (base_agent/tests) and the runner's (tests/)
+ruff check . # what CI lints for: syntax errors and undefined names
+```
+Neither test suite calls a model or starts a container.
 
 ## Self-Improvement Loop
 
@@ -216,7 +224,11 @@ Please see `base_agent/README.md` for a more detailed discussion of the base age
 ├── results
 │   ├── run_<id>
 │   └── interactive_output
-├── runner.py
+├── orchestrator          # the runner: evaluation, agent creation, the loop
+├── search                # parent selection, evaluation design, validation gate, reports
+├── runner.py             # entry point
+├── runner_config.py      # runner settings
+├── tests                 # tests of the runner
 └── sandbox
 ```
 

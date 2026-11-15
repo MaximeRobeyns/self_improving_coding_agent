@@ -71,9 +71,9 @@ class TestAgentCalling:
     async def _setup_callgraph(self):
         """Set up and clean up callgraph state."""
         graph = await CallGraphManager.get_instance()
-        graph.reset()
+        graph.clear()
         yield
-        graph.reset()
+        graph.clear()
 
     @pytest.fixture(autouse=True)
     def _setup_agent_registry(self):
@@ -154,7 +154,7 @@ class TestAgentCalling:
     async def test_successful_agent_execution(self, parent_agent):
         """Test complete flow of successful agent execution."""
         # Ensure we await our parent_agent fixture
-        caller = await parent_agent
+        caller = parent_agent
 
         # Register test agent in registry
         agent_registry["test_agent"] = SimpleTestAgent
@@ -226,7 +226,7 @@ class TestAgentCalling:
     @pytest.mark.asyncio
     async def test_error_handling(self, parent_agent):
         """Test handling of agent execution errors."""
-        caller = await parent_agent
+        caller = parent_agent
 
         # Register test agent in registry
         agent_registry["test_agent"] = SimpleTestAgent
@@ -288,7 +288,7 @@ class TestAgentCalling:
     @pytest.mark.asyncio
     async def test_agent_cancellation(self, parent_agent):
         """Test proper handling of agent cancellation."""
-        caller = await parent_agent
+        caller = parent_agent
 
         # Get event bus instance early
         bus = await EventBus.get_instance()

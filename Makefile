@@ -73,3 +73,23 @@ test_meta_int:  ## Interactivley test the resulting agent from the target above
 
 help:
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+clean-sandbox:
+	docker rm -f sica_sandbox
+
+deepclean:
+	rm -rf .venv base_agent/__pycache__ results
+	docker rmi sica_sandbox
+
+clean-build:
+	@$(MAKE) clean-sandbox
+	@$(MAKE) deepclean
+build:
+	pip install -r base_agent/requirements.txt
+rebuild:
+	$(MAKE) clean-build;
+	python3 -m venv .venv && source .venv/bin/activate
+	$(MAKE) build
+	$(MAKE) image-mac	
+
+

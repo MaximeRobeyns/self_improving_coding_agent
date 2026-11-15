@@ -431,12 +431,13 @@ class AnthropicProvider(BaseProvider):
                 else vars(usage_data)
             )
             return TokenUsage(
-                uncached_prompt_tokens=usage_dict.get("input_tokens", 0),
+                # Newer SDK versions report absent counts as None, not 0
+                uncached_prompt_tokens=usage_dict.get("input_tokens") or 0,
                 cache_write_prompt_tokens=usage_dict.get(
-                    "cache_creation_input_tokens", 0
-                ),
-                cached_prompt_tokens=usage_dict.get("cache_read_input_tokens", 0),
-                completion_tokens=usage_dict.get("output_tokens", 0),
+                    "cache_creation_input_tokens"
+                ) or 0,
+                cached_prompt_tokens=usage_dict.get("cache_read_input_tokens") or 0,
+                completion_tokens=usage_dict.get("output_tokens") or 0,
             )
         except Exception as e:
             logger.warning(f"Failed to create token usage: {e}")

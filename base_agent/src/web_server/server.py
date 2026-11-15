@@ -12,7 +12,7 @@ import logging
 from typing import Dict, List, Optional, Set
 from datetime import datetime
 from pathlib import Path
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -126,9 +126,9 @@ def format_event(event: Event | FileEvent) -> Dict:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def root():
+async def root(request: Request):
     """Serve the visualization UI."""
-    return templates.TemplateResponse("index.html", {"request": {}})
+    return templates.TemplateResponse(request, "index.html")
 
 
 @app.websocket("/ws")
